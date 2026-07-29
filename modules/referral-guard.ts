@@ -8,10 +8,10 @@
 import { PhoenixApiClient } from './phoenix-api.js';
 import { shortAddr } from './utils.js';
 
-const REFERRAL_CODE = 'V9EZG25S';
+const REFERRAL_CODES = ['V9EZG25S', 'X95ET4N2'];
 
 /**
- * Check if a wallet is registered through the required referral code.
+ * Check if a wallet is registered through any of the required referral codes.
  * Fails closed: any uncertainty = reject.
  */
 export async function checkReferral(
@@ -19,28 +19,30 @@ export async function checkReferral(
   walletAddress: string
 ): Promise<{ passed: boolean; reason: string }> {
   try {
-    const validateResult = await apiClient.validateInvite({
-      code: REFERRAL_CODE,
-      wallet_address: walletAddress,
-    });
+    // Try each referral code
+    for (const code of REFERRAL_CODES) {
+      const validateResult = await apiClient.validateInvite({
+        code,
+        wallet_address: walletAddress,
+      });
 
-    if (validateResult.success || validateResult.whitelisted) {
-      return {
-        passed: true,
-        reason: `Wallet ${shortAddr(walletAddress)} verified with referral code`,
-      };
+      if (validateResult.success || validateResult.whitelisted) {
+        return {
+          passed: true,
+          reason: `Wallet ${shortAddr(walletAddress)} verified with referral code`,
+        };
+      }
     }
 
-    // validateInvite didn't confirm referral — check on-chain state
+    // None of the codes confirmed referral — check on-chain state
     try {
       const state = await apiClient.getTraderState(walletAddress);
       const onChainState = state.snapshot?.capabilities?.state;
 
       if (onChainState) {
-        // Wallet exists on-chain in ANY state but referral not confirmed — reject
         return {
           passed: false,
-          reason: `Wallet ${shortAddr(walletAddress)} is on-chain (${onChainState}) but NOT registered through the referral code`,
+          reason: `Wallet ${shortAddr(walletAddress)} is on-chain (${onChainState}) but NOT registered through any referral code`,
         };
       }
     } catch {
@@ -90,7 +92,7 @@ export async function runReferralGuard(
     for (const addr of failed) {
       console.log(`  - ${addr}`);
     }
-    console.log(`\nRegister at https://www.phoenix.trade/?ref=${REFERRAL_CODE}`);
+    console.log(`\nRegister at https://www.phoenix.trade/?code=${REFERRAL_CODES[0]}`);
     console.log(`${'='.repeat(60)}\n`);
     throw new Error(`Referral guard failed for ${failed.length} wallet(s).`);
   }

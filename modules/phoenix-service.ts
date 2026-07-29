@@ -25,7 +25,7 @@ import {
 
 const PHOENIX_API_URL = 'https://perp-api.phoenix.trade';
 const SOLANA_RPC = 'https://api.mainnet-beta.solana.com';
-const REFERRAL_CODE = 'V9EZG25S';
+const REFERRAL_CODES = ['V9EZG25S', 'X95ET4N2'];
 
 // ==================== TYPES ====================
 
@@ -143,16 +143,27 @@ export class PhoenixService {
   }
 
   private async activateReferral(): Promise<void> {
-    const result = await this.apiClient.activateReferral({
-      code: REFERRAL_CODE,
-      wallet_address: this.walletAddress,
-    });
+    let lastError = '';
 
-    if (result.success) {
-      console.log(`  ✅ [${this.walletAddress.slice(0, 6)}] Referral code activated`);
-    } else {
-      throw new Error(`Referral activation failed: ${result.message}`);
+    for (const code of REFERRAL_CODES) {
+      try {
+        const result = await this.apiClient.activateReferral({
+          code,
+          wallet_address: this.walletAddress,
+        });
+
+        if (result.success) {
+          console.log(`  ✅ [${this.walletAddress.slice(0, 6)}] Referral code activated`);
+          return;
+        }
+
+        lastError = result.message;
+      } catch (e: any) {
+        lastError = e.message;
+      }
     }
+
+    throw new Error(`Referral activation failed with all codes: ${lastError}`);
   }
 
   // ==================== BALANCE ====================

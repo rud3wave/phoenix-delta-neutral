@@ -1,5 +1,3 @@
 node_modules/
 databases/
-input_data/privatekeys.txt
-input_data/proxies.txt
 *.log

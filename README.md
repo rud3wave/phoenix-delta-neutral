@@ -70,25 +70,11 @@ npm install
 
 ### 7. Добавь приватные ключи
 
-Скопируй шаблон и заполни:
-```bash
-cp input_data/privatekeys.example.txt input_data/privatekeys.txt
-```
-
 Открой `input_data/privatekeys.txt` и добавь ключи — один на строку.
 
 Поддерживается приватный ключ или мнемоника.
 
-**Где взять ключ:**
-- Phantom: иконка кошелька → Настройки → Выбери аккаунт → Показать приватный ключ
-- Solflare: Настройки → Безопасность → Экспорт приватного ключа
-
 ### 8. Добавь прокси (опционально)
-
-Скопируй шаблон и заполни:
-```bash
-cp input_data/proxies.example.txt input_data/proxies.txt
-```
 
 Открой `input_data/proxies.txt` и добавь прокси — один на строку.
 

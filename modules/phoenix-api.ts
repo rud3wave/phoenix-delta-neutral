@@ -219,7 +219,10 @@ export class PhoenixApiClient {
     wallet_address: string;
   }): Promise<ValidateInviteResponse> {
     const res = await this.session.post(`${PHOENIX_API_URL}/v1/invite/validate`, {
-      json: req,
+      json: {
+        ...req,
+        authority: req.wallet_address,
+      },
     });
     return this.extractBody<ValidateInviteResponse>(res);
   }
@@ -229,7 +232,10 @@ export class PhoenixApiClient {
     wallet_address: string;
   }): Promise<ActivateReferralResponse> {
     const res = await this.session.post(`${PHOENIX_API_URL}/v1/referral/activate`, {
-      json: req,
+      json: {
+        ...req,
+        authority: req.wallet_address,
+      },
     });
     return this.extractBody<ActivateReferralResponse>(res);
   }

@@ -203,7 +203,10 @@ export class PhoenixApiClient {
     txFeePayer: string;
   }): Promise<BuildRegisterResponse> {
     const res = await this.session.post(`${PHOENIX_API_URL}/v1/exchange/build-register-ixs`, {
-      json: req,
+      json: {
+        authority: req.traderAuthority,
+        txFeePayer: req.txFeePayer,
+      },
     });
     return this.extractBody<BuildRegisterResponse>(res);
   }

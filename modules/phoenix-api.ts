@@ -205,6 +205,7 @@ export class PhoenixApiClient {
     const res = await this.session.post(`${PHOENIX_API_URL}/v1/exchange/build-register-ixs`, {
       json: {
         authority: req.traderAuthority,
+        traderAuthority: req.traderAuthority,
         txFeePayer: req.txFeePayer,
       },
     });

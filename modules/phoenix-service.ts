@@ -248,9 +248,19 @@ export class PhoenixService {
     });
 
     if (registerResponse.includeRegisterTrader && registerResponse.instructions.length > 0) {
-      const txHash = await this.buildSignAndSendTransaction(registerResponse.instructions);
-      console.log(`  ✅ [${this.walletAddress.slice(0, 6)}] Trader registered | tx: ${txHash}`);
-      this.traderPda = registerResponse.traderPda;
+      try {
+        const txHash = await this.buildSignAndSendTransaction(registerResponse.instructions);
+        console.log(`  ✅ [${this.walletAddress.slice(0, 6)}] Trader registered | tx: ${txHash}`);
+        this.traderPda = registerResponse.traderPda;
+      } catch (e: any) {
+        const msg = e?.message ?? String(e);
+        if (msg.includes('insufficient lamports')) {
+          const match = msg.match(/need (\d+)/);
+          const needSol = match ? (parseInt(match[1]!) / 1e9).toFixed(3) : '0.04';
+          throw new Error(`Not enough SOL for registration (need ~${needSol} SOL). Send SOL to this wallet first.`);
+        }
+        throw e;
+      }
     }
 
     // Referral — only for newly registered accounts

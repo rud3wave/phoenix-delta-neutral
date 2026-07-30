@@ -284,7 +284,10 @@ async function main(): Promise<void> {
   printBanner();
   setupShutdown();
 
-  // Step 1: Load wallets
+  // Step 1: Mode selector (before any connection)
+  const mode = await askMode();
+
+  // Step 2: Load wallets
   let wallets: WalletAccount[];
   try {
     wallets = await initWallets();
@@ -299,7 +302,7 @@ async function main(): Promise<void> {
     console.log('🔀 Wallets shuffled');
   }
 
-  // Step 2: Create services (login + register)
+  // Step 3: Create services (login + register)
   console.log('\n🔌 Connecting to Phoenix...');
   const services = await createServices(wallets);
 
@@ -310,9 +313,7 @@ async function main(): Promise<void> {
 
   console.log(`\n✅ ${services.length}/${wallets.length} wallet(s) connected`);
 
-  // Step 3: Mode selector
-  const mode = await askMode();
-
+  // Step 4: Execute selected mode
   try {
     switch (mode) {
       case '1':

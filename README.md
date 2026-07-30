@@ -183,6 +183,17 @@ phoenix-delta-neutral/
 
 ---
 
+## Troubleshooting
+
+**npm install падает с ошибкой**
+Убедись что Node.js 20+ (`node -v`). Очисти кэш и переустанови:
+```bash
+rm -rf node_modules package-lock.json
+npm install
+```
+
+---
+
 ## Дисклеймер
 
 Этот софт предоставляется «как есть». Используй на свой риск. Торговля криптовалютами связана с риском потери средств.

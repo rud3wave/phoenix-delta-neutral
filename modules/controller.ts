@@ -108,6 +108,12 @@ export class DeltaNeutralController {
         const groupSize = sideACount + sideBCount;
 
         if (this.pool.length < groupSize) {
+          // Check if ANY config can be satisfied
+          const canFormGroup = GROUP_CONFIGS.some(([a, b]) => this.pool.length >= a + b);
+          if (!canFormGroup) {
+            console.log(`\n⚠️ Not enough wallets for any group config (have ${this.pool.length}). Stopping.`);
+            break;
+          }
           console.log(`  ⏳ Not enough wallets for group [${sideACount},${sideBCount}] (need ${groupSize}, have ${this.pool.length}). Waiting...`);
           await sleep(10);
           continue;

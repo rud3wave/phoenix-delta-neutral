@@ -3,3 +3,7 @@ databases/
 input_data/privatekeys.txt
 input_data/proxies.txt
 *.log
+.tmp*
+tmp-*
+.playwright-mcp/
+debug-*.log

@@ -499,6 +499,35 @@ export class PhoenixService {
 
   // ==================== CLOSE POSITIONS ====================
 
+  /** Snapshot open positions for TG/PnL reporting before a force-close. */
+  public async getOpenPositionSummaries(): Promise<
+    Array<{ symbol: string; side: 'long' | 'short'; quantity: number; positionUsd: number }>
+  > {
+    const state = await this.apiClient.getTraderState(this.walletAddress);
+    const subaccounts = state.snapshot?.subaccounts ?? [];
+    const out: Array<{ symbol: string; side: 'long' | 'short'; quantity: number; positionUsd: number }> = [];
+
+    for (const subaccount of subaccounts) {
+      for (const position of subaccount.positions ?? []) {
+        const baseLots = Number(position.basePositionLots);
+        if (baseLots === 0) continue;
+
+        const symbol = position.symbol;
+        await this.getBaseLotsDecimals(symbol);
+        const quantity = this.lotsToBaseUnits(Math.abs(baseLots), symbol);
+        const entryPrice = parseFloat(position.entryPriceUsd || '0');
+        out.push({
+          symbol,
+          side: baseLots > 0 ? 'long' : 'short',
+          quantity,
+          positionUsd: quantity * entryPrice,
+        });
+      }
+    }
+
+    return out;
+  }
+
   public async closeAllPositionsAndOrders(): Promise<void> {
     const state = await this.apiClient.getTraderState(this.walletAddress);
     const subaccounts = state.snapshot?.subaccounts ?? [];
@@ -516,7 +545,7 @@ export class PhoenixService {
         const baseUnits = this.lotsToBaseUnits(Math.abs(baseLots), symbol);
         const closeSide = baseLots > 0 ? 'short' : 'long'; // opposite side to close
 
-        console.log(`  🔄 Closing ${symbol} | ${closeSide.toUpperCase()} | ${baseUnits.toFixed(6)} base units`);
+        console.log(`  🔄 Closing ${symbol} | ${closeSide.toUpperCase()} | ${parseFloat(baseUnits.toFixed(6))} ${symbol}`);
 
         try {
           await this.placePositionOrder({
@@ -632,7 +661,7 @@ export class PhoenixService {
     const baseUnits = this.lotsToBaseUnits(Math.abs(Number(position.basePositionLots)), symbol);
     const closeSide = Number(position.basePositionLots) > 0 ? 'short' : 'long';
 
-    console.log(`  📋 Closing ${symbol} via LIMIT | ${closeSide.toUpperCase()} | ${baseUnits.toFixed(6)} base units`);
+    console.log(`  📋 Closing ${symbol} via LIMIT | ${closeSide.toUpperCase()} | ${parseFloat(baseUnits.toFixed(6))} ${symbol}`);
 
     await this.placePositionOrder({
       instrument: symbol,

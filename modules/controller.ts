@@ -10,6 +10,7 @@
 import {
   GROUP_CONFIGS,
   LEVERAGE_RANGE,
+  MARGIN_MODE,
   MARGIN_RANGE,
   MAX_SPREAD,
   LIMIT_FILL_TIMEOUT_MINUTES,
@@ -31,6 +32,17 @@ import {
   shuffleArray,
   shortAddr,
 } from './utils.js';
+
+// ==================== HELPERS ====================
+
+/** Resolve MARGIN_RANGE value to USDC based on MARGIN_MODE. */
+function resolveMargin(balanceUsd: number, rangeValue: number): number {
+  if (MARGIN_MODE === 'percent') {
+    const pct = Math.min(Math.max(rangeValue, 0), 100);
+    return balanceUsd * (pct / 100);
+  }
+  return rangeValue;
+}
 
 // ==================== TYPES ====================
 
@@ -60,6 +72,7 @@ interface ActiveGroup {
 export class DeltaNeutralController {
   private pool: GroupAccount[] = [];
   private isRunning = false;
+  private nextGroupId = 1;
 
   /** Register a wallet into the pool */
   public register(service: PhoenixService, balance: number): void {
@@ -142,8 +155,10 @@ export class DeltaNeutralController {
         }
 
         // Validate balances can cover min margin
-        const minMargin = MARGIN_RANGE[0];
-        const canCover = selected.every((acc) => acc.balance * 0.99 >= minMargin);
+        const canCover = selected.every((acc) => {
+          const minMargin = resolveMargin(acc.balance, MARGIN_RANGE[0]);
+          return acc.balance * 0.99 >= minMargin && minMargin > 0;
+        });
         if (!canCover) {
           console.log('  ⚠️ Some wallets cannot cover min margin. Returning to pool.');
           this.pool = [...remaining, ...selected];
@@ -154,7 +169,7 @@ export class DeltaNeutralController {
         // Pick token
         const srcToken = TOKENS_TO_TRADE[Math.floor(Math.random() * TOKENS_TO_TRADE.length)]!;
 
-        const groupId = Math.floor(100000 + Math.random() * 900000).toString();
+        const groupId = String(this.nextGroupId++);
         const group: ActiveGroup = {
           id: groupId,
           accounts: selected,
@@ -242,7 +257,7 @@ export class DeltaNeutralController {
     const accountData = sorted.map((account) => {
       const leverage = getRandomNumber(LEVERAGE_RANGE);
       const safeBalance = account.balance * 0.99;
-      const margin = Math.min(getRandomNumber(MARGIN_RANGE), safeBalance);
+      const margin = Math.min(resolveMargin(account.balance, getRandomNumber(MARGIN_RANGE)), safeBalance);
       const notional = margin * leverage;
       return { account, leverage, margin, notional };
     });

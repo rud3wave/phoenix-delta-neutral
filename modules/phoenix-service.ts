@@ -7,7 +7,6 @@ import {
   createPhoenixClient,
   Side,
   buildAcceptEscrowRequestIx,
-  buildDepositFlow,
   getPhoenixEscrowAddress,
   getPhoenixTraderSubaccountAddress,
   PHOENIX_PROGRAM_ADDRESS,
@@ -17,6 +16,7 @@ import {
 import { base58 } from '@scure/base';
 import {
   address,
+  createSolanaRpc,
   createTransactionMessage,
   setTransactionMessageFeePayer,
   appendTransactionMessageInstructions,
@@ -231,9 +231,12 @@ export class PhoenixService {
       }
 
       if (onChainState) {
-        // Already registered (cold/reduceOnly/etc) — no need to register again
+        // Registered but not fully active — finish referral onboarding via activate-tx
         this.traderPda = state.authority;
-        await this.activateReferral();
+        const activated = await this.activateReferralViaTx();
+        if (!activated) {
+          console.log(`  ⚠️ [${this.walletAddress.slice(0, 6)}] Registered but referral activation skipped`);
+        }
         return;
       }
     } catch {
@@ -242,57 +245,172 @@ export class PhoenixService {
 
     console.log(`  📝 [${this.walletAddress.slice(0, 6)}] Registering trader on Phoenix...`);
 
+    // Preferred path: referral activate-tx (API co-signs as onboarder + broadcasts)
+    const activated = await this.activateReferralViaTx();
+    if (activated) return;
+
+    // Fallback: builder flow without referral (build-register-ixs → send-register-ixs)
+    await this.registerWithoutReferral();
+  }
+
+  /**
+   * Onboard via POST /v1/referral/activate-tx.
+   * Builds + partially signs locally; Phoenix adds onboarder sig and submits.
+   */
+  private async activateReferralViaTx(): Promise<boolean> {
+    const tag = this.walletAddress.slice(0, 6);
+    const signer = await createKeyPairSignerFromBytes(this.wallet.secretKey);
+    const rpc = createSolanaRpc(this.connection.rpcEndpoint);
+
+    const client = createPhoenixClient({
+      apiUrl: PHOENIX_API_URL,
+      rpcUrl: this.connection.rpcEndpoint,
+      auth: false,
+      ws: false,
+      exchangeMetadata: { stream: false },
+    });
+
+    try {
+      for (const code of REFERRAL_CODES) {
+        try {
+          const latestBlockhash = await rpc
+            .getLatestBlockhash({ commitment: 'finalized' })
+            .send();
+
+          const built = await client.api.invite().buildActivateReferralTxRequest({
+            referralCode: code,
+            traderAuthority: signer.address as any,
+            traderPdaIndex: 0,
+            traderSubaccountIndex: 0,
+            recentBlockhash: latestBlockhash.value.blockhash,
+            lastValidBlockHeight: latestBlockhash.value.lastValidBlockHeight,
+            registerTraderMaxPositions: 128n,
+            rpc,
+            signTransaction: (transaction: any) =>
+              partiallySignTransaction([signer.keyPair], transaction),
+          });
+
+          const response = await this.apiClient.activateReferralTx(built.request);
+          this.traderPda = response.trader_pda;
+
+          if (response.status === 'already_activated') {
+            console.log(`  ✅ [${tag}] Already onboarded (referral ${code})`);
+            return true;
+          }
+
+          const sig = response.signature ?? 'n/a';
+          console.log(`  ✅ [${tag}] Registered via referral ${code} | status=${response.status} | tx: ${sig}`);
+
+          // Phoenix broadcasts; confirm via trader state rather than public RPC alone
+          await this.waitUntilTraderActive(45_000);
+          return true;
+        } catch (e: any) {
+          const msg = e?.message ?? String(e);
+          if (msg.includes('insufficient lamports')) {
+            const match = msg.match(/need (\d+)/);
+            const needSol = match ? (parseInt(match[1]!) / 1e9).toFixed(3) : '0.04';
+            throw new Error(`Not enough SOL (need ~${needSol} SOL). Send SOL to this wallet first.`);
+          }
+          // Invalid/exhausted code or transient API error — try next code
+          console.log(`  ⚠️ [${tag}] Referral ${code} failed: ${msg.slice(0, 160)}`);
+        }
+      }
+      return false;
+    } finally {
+      client.dispose();
+    }
+  }
+
+  /**
+   * Fallback onboarding without referral:
+   * build-register-ixs → local sign → send-register-ixs (API co-signs + broadcasts).
+   */
+  private async registerWithoutReferral(): Promise<void> {
+    const tag = this.walletAddress.slice(0, 6);
+
     const registerResponse = await this.apiClient.buildRegisterInstructions({
       traderAuthority: this.walletAddress,
       txFeePayer: this.walletAddress,
+      maxPositions: 128,
     });
 
-    if (registerResponse.includeRegisterTrader && registerResponse.instructions.length > 0) {
-      try {
-        const txHash = await this.buildSignAndSendTransaction(registerResponse.instructions);
-        console.log(`  ✅ [${this.walletAddress.slice(0, 6)}] Trader registered | tx: ${txHash}`);
-        this.traderPda = registerResponse.traderPda;
-      } catch (e: any) {
-        const msg = e?.message ?? String(e);
-        if (msg.includes('insufficient lamports')) {
-          const match = msg.match(/need (\d+)/);
-          const needSol = match ? (parseInt(match[1]!) / 1e9).toFixed(3) : '0.04';
-          throw new Error(`Not enough SOL (need ~${needSol} SOL). Send SOL to this wallet first.`);
-        }
-        // On any error, check if registration landed anyway
-        try {
-          const recheck = await this.apiClient.getTraderState(this.walletAddress);
-          if (recheck.snapshot?.capabilities?.state) {
-            console.log(`  ✅ [${this.walletAddress.slice(0, 6)}] Registration confirmed on-chain`);
-            this.traderPda = recheck.authority;
-          } else {
-            throw new Error(`Registration failed: ${msg}`);
-          }
-        } catch {
-          throw new Error(`Registration failed: ${msg}`);
-        }
-      }
+    this.traderPda = registerResponse.traderPda;
+
+    if (!registerResponse.includeRegisterTrader || registerResponse.instructions.length === 0) {
+      console.log(`  ✅ [${tag}] Trader already registered on-chain`);
+      return;
     }
 
-    // Referral — only for newly registered accounts
-    await this.activateReferral();
-  }
+    try {
+      const { blockhash } = await this.connection.getLatestBlockhash('finalized');
+      const ixs = registerResponse.instructions.map((ix) => ({
+        programId: new PublicKey(ix.programId),
+        keys: ix.keys.map((key) => ({
+          pubkey: new PublicKey(key.pubkey),
+          isSigner: key.isSigner,
+          isWritable: key.isWritable,
+        })),
+        data: Buffer.from(ix.data),
+      }));
 
-  private async activateReferral(): Promise<void> {
-    for (const code of REFERRAL_CODES) {
+      const messageV0 = new TransactionMessage({
+        payerKey: this.wallet.publicKey,
+        recentBlockhash: blockhash,
+        instructions: ixs,
+      }).compileToV0Message();
+
+      const transaction = new VersionedTransaction(messageV0);
+      transaction.sign([this.wallet]);
+      const transactionB64 = Buffer.from(transaction.serialize()).toString('base64');
+
+      const result = await this.apiClient.sendRegisterIxs({
+        transaction: transactionB64,
+        traderAuthority: this.walletAddress,
+        txFeePayer: this.walletAddress,
+        maxPositions: 128,
+        traderPdaIndex: 0,
+        traderSubaccountIndex: 0,
+      });
+
+      this.traderPda = result.traderPda;
+      console.log(`  ✅ [${tag}] Trader registered | tx: ${result.signature}`);
+      await this.waitUntilTraderActive(45_000);
+    } catch (e: any) {
+      const msg = e?.message ?? String(e);
+      if (msg.includes('insufficient lamports')) {
+        const match = msg.match(/need (\d+)/);
+        const needSol = match ? (parseInt(match[1]!) / 1e9).toFixed(3) : '0.04';
+        throw new Error(`Not enough SOL (need ~${needSol} SOL). Send SOL to this wallet first.`);
+      }
+
       try {
-        const validateResult = await this.apiClient.validateInvite({
-          code,
-          wallet_address: this.walletAddress,
-        });
-
-        if (validateResult.success) {
-          console.log(`  ✅ [${this.walletAddress.slice(0, 6)}] Referral code activated`);
+        const recheck = await this.apiClient.getTraderState(this.walletAddress);
+        if (recheck.snapshot?.capabilities?.state) {
+          console.log(`  ✅ [${tag}] Registration confirmed on-chain`);
+          this.traderPda = recheck.authority;
           return;
         }
       } catch {
-        // try next code silently
+        // ignore
       }
+      throw new Error(`Registration failed: ${msg}`);
+    }
+  }
+
+  private async waitUntilTraderActive(timeoutMs = 45_000): Promise<void> {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      try {
+        const state = await this.apiClient.getTraderState(this.walletAddress);
+        const onChainState = state.snapshot?.capabilities?.state;
+        if (onChainState) {
+          this.traderPda = state.authority;
+          return;
+        }
+      } catch {
+        // not visible yet
+      }
+      await sleep(2);
     }
   }
 
@@ -1044,13 +1162,16 @@ export class PhoenixService {
     });
 
     try {
-      const flow = await buildDepositFlow(
-        {
-          authority: this.walletAddress as any,
-          amount: BigInt(depositAmount),
-        },
-        client as any
-      );
+      const flow = await (client as any).ixs.buildDepositIxs({
+        authority: this.walletAddress,
+        traderPdaIndex: 0,
+        traderSubaccountIndex: 0,
+        amount: BigInt(depositAmount),
+      });
+
+      if (!flow?.instructions?.length) {
+        throw new Error('No deposit instructions built');
+      }
 
       // Convert kit instructions to legacy TransactionInstruction
       const ixs = flow.instructions.map((ix: any) => {

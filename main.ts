@@ -92,8 +92,8 @@ async function createServices(wallets: WalletAccount[]): Promise<PhoenixService[
     wallets.map(async (wallet) => {
       const service = new PhoenixService(wallet.keypair, wallet.proxyUrl);
 
+      // loginHandler already runs ensureRegistered() after auth
       await service.loginHandler();
-      await service.ensureRegistered();
 
       return service;
     })

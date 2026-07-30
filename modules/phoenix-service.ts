@@ -259,7 +259,25 @@ export class PhoenixService {
           const needSol = match ? (parseInt(match[1]!) / 1e9).toFixed(3) : '0.04';
           throw new Error(`Not enough SOL for registration (need ~${needSol} SOL). Send SOL to this wallet first.`);
         }
-        throw e;
+
+        // Timeout or other error — check if registration actually landed on-chain
+        if (msg.includes('timeout') || msg.includes('confirmation')) {
+          console.log(`  ⏳ [${this.walletAddress.slice(0, 6)}] Confirmation timeout — checking on-chain status...`);
+          try {
+            const recheck = await this.apiClient.getTraderState(this.walletAddress);
+            const recheckState = recheck.snapshot?.capabilities?.state;
+            if (recheckState) {
+              console.log(`  ✅ [${this.walletAddress.slice(0, 6)}] Registration landed on-chain (${recheckState}) despite timeout`);
+              this.traderPda = recheck.authority;
+            } else {
+              throw e;
+            }
+          } catch {
+            throw new Error(`Registration tx sent but not confirmed. Try again — it may have landed.`);
+          }
+        } else {
+          throw e;
+        }
       }
     }
 

@@ -17,6 +17,7 @@ import {
   readPrivateKeys,
   saveEncryptedWallets,
   loadEncryptedWallets,
+  createKeypair,
   type WalletAccount,
 } from './modules/wallet.js';
 import { sleep, shuffleArray, shortAddr } from './modules/utils.js';
@@ -52,18 +53,33 @@ function askMode(): Promise<string> {
 // ==================== WALLET INITIALIZATION ====================
 
 async function initWallets(): Promise<WalletAccount[]> {
-  // Try loading from encrypted storage first
+  // Always read from privatekeys.txt to check for changes
+  const rawKeys = readPrivateKeys();
+  const txtAddresses = rawKeys.map((k) => createKeypair(k).publicKey.toString());
+
+  // Try loading from encrypted storage
   const encrypted = loadEncryptedWallets();
+
   if (encrypted && encrypted.length > 0) {
-    return encrypted;
+    const dbAddresses = encrypted.map((w) => w.address);
+
+    // Compare: same count and same addresses in same order?
+    const match =
+      txtAddresses.length === dbAddresses.length &&
+      txtAddresses.every((addr, i) => addr === dbAddresses[i]);
+
+    if (match) {
+      console.log(`🔓 Loaded ${encrypted.length} wallet(s) from encrypted storage`);
+      return encrypted;
+    }
+
+    console.log(`\n🔄 privatekeys.txt changed (${txtAddresses.length} keys) vs DB (${dbAddresses.length} keys) — re-encrypting...`);
+  } else {
+    console.log('\n📂 First run — loading wallets from privatekeys.txt...');
   }
 
-  // First run: load from privatekeys.txt, encrypt, and save
-  console.log('\n📂 First run — loading wallets from privatekeys.txt...');
-  const rawKeys = readPrivateKeys();
+  // Load from txt and encrypt
   const wallets = loadWallets();
-
-  // Encrypt and persist
   saveEncryptedWallets(rawKeys, wallets);
 
   return wallets;

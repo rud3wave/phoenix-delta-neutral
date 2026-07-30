@@ -7,7 +7,7 @@
 // --- ОБЩИЕ НАСТРОЙКИ ---
 
 // Количество потоков (одновременно работающих кошельков)
-export const THREADS = 3;
+export const THREADS = 5;
 
 // Перемешивать кошельки перед запуском
 export const SHUFFLE_WALLETS = true;
@@ -23,7 +23,7 @@ export const TOKENS_TO_TRADE = ['ETH'];
 
 // Маржа (сколько баланса задействовать на позицию в USD)
 // [мин, макс] — рандомное значение из диапазона
-export const MARGIN_RANGE: [number, number] = [50, 200];
+export const MARGIN_RANGE: [number, number] = [250, 350];
 
 // Плечо (множитель)
 // [мин, макс] — рандомное значение из диапазона
@@ -34,7 +34,7 @@ export const LEVERAGE_RANGE: [number, number] = [7, 15];
 // ДОЛЖНО совпадать с количеством кошельков!
 // 3 кошелька → [2, 1] или [1, 2]
 // 5 кошельков → [3, 2] или [2, 3]
-export const GROUP_CONFIGS: [number, number][] = [[2, 1]];
+export const GROUP_CONFIGS: [number, number][] = [[3, 2]];
 
 // --- НАСТРОЙКИ ОРДЕРОВ ---
 
@@ -56,7 +56,7 @@ export const DELAY_AFTER_LEADER_FILL: [number, number] = [0, 1];
 
 // Время удержания позиций перед закрытием (минуты) [мин, макс]
 // [0, 0] = держать бесконечно (закрытие вручную через close-positions)
-export const HOLD_MINUTES: [number, number] = [5, 15];
+export const HOLD_MINUTES: [number, number] = [10000, 12000];
 
 // Количество торговых циклов (открытие → закрытие = 1 цикл)
 export const TRADES_COUNT: [number, number] = [2, 5];

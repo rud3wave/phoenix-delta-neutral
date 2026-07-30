@@ -8,10 +8,11 @@
 import { PhoenixApiClient } from './phoenix-api.js';
 import { shortAddr } from './utils.js';
 
-const REFERRAL_CODES = ['V9EZG25S', 'X95ET4N2'];
+const REFERRAL_CODES = ['V9EZG25S', 'X95ET4N2', '23PUTC8U', 'PAKARXCD', 'GD77P82A'];
 
 /**
  * Check if a wallet is registered through any of the required referral codes.
+ * Uses /v1/invite/check/{wallet} which returns the invite_code_used.
  * Fails closed: any uncertainty = reject.
  */
 export async function checkReferral(
@@ -19,34 +20,38 @@ export async function checkReferral(
   walletAddress: string
 ): Promise<{ passed: boolean; reason: string }> {
   try {
-    // Try each referral code
-    for (const code of REFERRAL_CODES) {
-      const validateResult = await apiClient.validateInvite({
-        code,
-        wallet_address: walletAddress,
-      });
+    const check = await apiClient.checkWallet(walletAddress);
 
-      if (validateResult.success || validateResult.whitelisted) {
-        return {
-          passed: true,
-          reason: `Wallet ${shortAddr(walletAddress)} verified with referral code`,
-        };
-      }
+    // Wallet has an invite code — check if it's one of ours
+    if (check.invite_code_used && REFERRAL_CODES.includes(check.invite_code_used)) {
+      return {
+        passed: true,
+        reason: `Wallet ${shortAddr(walletAddress)} verified with referral code [${check.invite_code_used}]`,
+      };
     }
 
-    // None of the codes confirmed referral — check on-chain state
+    // Wallet has a different invite code or whitelisted
+    if (check.whitelisted) {
+      return {
+        passed: true,
+        reason: `Wallet ${shortAddr(walletAddress)} is whitelisted`,
+      };
+    }
+
+    // No invite code used — check if wallet exists on-chain
     try {
       const state = await apiClient.getTraderState(walletAddress);
       const onChainState = state.snapshot?.capabilities?.state;
 
       if (onChainState) {
+        // Wallet is on-chain but NOT registered through our code
         return {
           passed: false,
-          reason: `Wallet ${shortAddr(walletAddress)} is on-chain (${onChainState}) but NOT registered through any referral code`,
+          reason: `Wallet ${shortAddr(walletAddress)} is on-chain (${onChainState}) but NOT registered through our referral code`,
         };
       }
     } catch {
-      // Not registered on-chain — new wallet, referral will be applied during registration
+      // Not registered on-chain — new wallet
     }
 
     // New wallet — allow, referral code will be applied during registration
@@ -55,7 +60,7 @@ export async function checkReferral(
       reason: `Wallet ${shortAddr(walletAddress)} is new — referral code will be applied during registration`,
     };
   } catch (e: any) {
-    // API error — fail closed, do not allow trading
+    // API error — fail closed
     return {
       passed: false,
       reason: `Referral check failed for ${shortAddr(walletAddress)}: ${e.message}`,

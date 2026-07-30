@@ -8,10 +8,9 @@
 
 import { createInterface } from 'node:readline';
 
-import { SHUFFLE_WALLETS, DELAY_BETWEEN_WALLETS } from './settings.js';
+import { SHUFFLE_WALLETS } from './settings.js';
 import { DeltaNeutralController } from './modules/controller.js';
 import { PhoenixService } from './modules/phoenix-service.js';
-import { runReferralGuard } from './modules/referral-guard.js';
 import { sendTg } from './modules/telegram.js';
 import {
   loadWallets,
@@ -20,7 +19,7 @@ import {
   loadEncryptedWallets,
   type WalletAccount,
 } from './modules/wallet.js';
-import { sleep, sleepByRange, shuffleArray, shortAddr } from './modules/utils.js';
+import { sleep, shuffleArray, shortAddr } from './modules/utils.js';
 
 // ==================== BANNER ====================
 
@@ -41,7 +40,7 @@ function askMode(): Promise<string> {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   return new Promise((resolve) => {
     rl.question(
-      `\nВыбери режим:\n  1 = Дельта-нейтральная торговля\n  2 = Закрыть все позиции\n  3 = Проверить балансы\n\n> `,
+      `\nВыбери режим:\n  1 = Дельта-нейтральная торговля\n  2 = Закрыть все позиции\n  3 = Проверить балансы\n  4 = Клеймить награды\n\n> `,
       (answer) => {
         rl.close();
         resolve(answer.trim());
@@ -73,32 +72,24 @@ async function initWallets(): Promise<WalletAccount[]> {
 // ==================== SERVICE CREATION ====================
 
 async function createServices(wallets: WalletAccount[]): Promise<PhoenixService[]> {
-  const services: PhoenixService[] = [];
+  const results = await Promise.allSettled(
+    wallets.map(async (wallet) => {
+      const service = new PhoenixService(wallet.keypair, wallet.proxyUrl);
 
-  for (const wallet of wallets) {
-    const service = new PhoenixService(wallet.keypair, wallet.proxyUrl);
-
-    // Login
-    try {
       await service.loginHandler();
-    } catch (e: any) {
-      console.log(`  ❌ Login failed for ${shortAddr(wallet.address)}: ${e.message}`);
-      continue;
-    }
-
-    // Register if needed (includes referral activation)
-    try {
       await service.ensureRegistered();
-    } catch (e: any) {
-      console.log(`  ❌ Registration failed for ${shortAddr(wallet.address)}: ${e.message}`);
-      continue;
-    }
 
-    services.push(service);
+      return service;
+    })
+  );
 
-    // Delay between wallets
-    if (wallets.indexOf(wallet) < wallets.length - 1) {
-      await sleepByRange(DELAY_BETWEEN_WALLETS, 'Delay between wallets');
+  const services: PhoenixService[] = [];
+  for (let i = 0; i < results.length; i++) {
+    const result = results[i]!;
+    if (result.status === 'fulfilled') {
+      services.push(result.value);
+    } else {
+      console.log(`  ❌ ${shortAddr(wallets[i]!.address)} | ${result.reason?.message ?? result.reason}`);
     }
   }
 
@@ -156,19 +147,65 @@ async function checkBalances(services: PhoenixService[]): Promise<void> {
   console.log('\n💰 Checking balances...\n');
 
   let totalBalance = 0;
+  const lines: string[] = ['💰 Checked balances', ''];
 
   for (const service of services) {
     const addr = shortAddr(service.getAddress());
     try {
       const balance = await service.getUsdcBalance();
       totalBalance += balance;
-      console.log(`  ${addr} | $${balance.toFixed(2)}`);
+      console.log(`  ✅ ${addr} | $${balance.toFixed(2)}`);
+      lines.push(`✅ ${addr} | $${balance.toFixed(2)}`);
     } catch (e: any) {
       console.log(`  ${addr} | error: ${e.message}`);
+      lines.push(`${addr} | error`);
     }
   }
 
   console.log(`\n  💎 Total: $${totalBalance.toFixed(2)} across ${services.length} wallet(s)`);
+  lines.push('', `💎 Total: $${totalBalance.toFixed(2)} across ${services.length} wallet(s)`);
+  await sendTg(lines.join('\n'));
+}
+
+// ==================== MODE 4: CLAIM REWARDS ====================
+
+async function claimRewards(services: PhoenixService[]): Promise<void> {
+  console.log('\n🎁 Claiming rewards...\n');
+
+  let claimedCount = 0;
+  let totalClaimed = 0;
+  const lines: string[] = ['🎁 Claiming rewards', ''];
+
+  for (const service of services) {
+    const addr = shortAddr(service.getAddress());
+    try {
+      const result = await service.claimRewards();
+      if (result.claimed) {
+        claimedCount++;
+        totalClaimed += result.amountUsd;
+        lines.push(`✅ ${addr} | +$${result.amountUsd.toFixed(2)}`);
+      } else {
+        console.log(`  ℹ️ ${addr} | Nothing to claim`);
+      }
+    } catch (e: any) {
+      console.log(`  ⚠️ ${addr} | ${e.message}`);
+      lines.push(`⚠️ ${addr} | ${e.message}`);
+    }
+
+    if (services.indexOf(service) < services.length - 1) {
+      await sleep(1 + Math.random());
+    }
+  }
+
+  lines.push('', `Claimed: $${totalClaimed.toFixed(2)} from ${claimedCount}/${services.length} wallet(s)`);
+
+  if (claimedCount > 0) {
+    console.log(`\n✅ Claimed $${totalClaimed.toFixed(2)} from ${claimedCount}/${services.length} wallet(s)`);
+  } else {
+    console.log('\nℹ️ Nothing to claim');
+  }
+
+  await sendTg(lines.join('\n'));
 }
 
 // ==================== GRACEFUL SHUTDOWN ====================
@@ -177,11 +214,8 @@ let controllerRef: DeltaNeutralController | null = null;
 
 function setupShutdown(): void {
   const shutdown = async () => {
-    console.log('\n\n🛑 Shutting down gracefully...');
     controllerRef?.stop();
-    await sendTg('BOT STOPPED | Graceful shutdown (Ctrl+C)');
-    // Give a moment for pending operations
-    await sleep(2);
+    await sleep(1);
     process.exit(0);
   };
 
@@ -221,37 +255,37 @@ async function main(): Promise<void> {
 
   console.log(`\n✅ ${services.length}/${wallets.length} wallet(s) connected`);
 
-  // Step 3: Referral guard
-  try {
-    await runReferralGuard(
-      services.map((s) => ({ address: s.getAddress(), apiClient: s.getApiClient() }))
-    );
-  } catch (e: any) {
-    console.log(`\n❌ ${e.message}`);
-    process.exit(1);
-  }
-
-  // Step 4: Mode selector
+  // Step 3: Mode selector
   const mode = await askMode();
 
-  switch (mode) {
-    case '1':
-      await runDeltaNeutral(services);
-      break;
-    case '2':
-      await closeAllPositions(services);
-      break;
-    case '3':
-      await checkBalances(services);
-      break;
-    default:
-      console.log(`\n❌ Неизвестный режим: "${mode}". Выбери 1, 2 или 3.`);
-      process.exit(1);
+  try {
+    switch (mode) {
+      case '1':
+        await runDeltaNeutral(services);
+        break;
+      case '2':
+        await closeAllPositions(services);
+        break;
+      case '3': {
+        await checkBalances(services);
+        break;
+      }
+      case '4':
+        await claimRewards(services);
+        break;
+      default:
+        console.log(`\n❌ Неизвестный режим: "${mode}". Выбери 1, 2, 3 или 4.`);
+        process.exit(1);
+    }
+  } catch (e: any) {
+    console.log(`\n❌ Mode ${mode} failed: ${e.message}`);
+    await sendTg(`❌ ERROR | Mode ${mode} | ${e.message}`);
   }
 }
 
-main().catch((e) => {
+main().catch(async (e) => {
   console.error(`\n💥 Fatal error: ${e.message}`);
   console.error(e.stack);
+  await sendTg(`💥 FATAL | ${e.message}`);
   process.exit(1);
 });

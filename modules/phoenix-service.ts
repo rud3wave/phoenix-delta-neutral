@@ -242,19 +242,26 @@ export class PhoenixService {
 
     console.log(`  📝 [${this.walletAddress.slice(0, 6)}] Registering trader on Phoenix...`);
 
+    // Get sponsorship fee payer first — needed for both buildRegister and tx compilation
+    let sponsorFeePayer: string | null = null;
+    try {
+      const { payers } = await this.apiClient.getFeePayers();
+      if (payers && payers.length > 0) {
+        sponsorFeePayer = payers[Math.floor(Math.random() * payers.length)];
+      }
+    } catch { /* no sponsorship available */ }
+
     const registerResponse = await this.apiClient.buildRegisterInstructions({
       traderAuthority: this.walletAddress,
-      txFeePayer: this.walletAddress,
+      txFeePayer: sponsorFeePayer ?? this.walletAddress,
     });
 
     if (registerResponse.includeRegisterTrader && registerResponse.instructions.length > 0) {
       try {
-        // Use sponsorship endpoint — backend broadcasts and pays rent/fees
-        const { payers } = await this.apiClient.getFeePayers();
-        if (!payers || payers.length === 0) {
+        if (!sponsorFeePayer) {
           throw new Error('No sponsored fee payers available for registration');
         }
-        const feePayer = payers[Math.floor(Math.random() * payers.length)];
+        const feePayer = sponsorFeePayer;
 
         // Convert instructions to legacy TransactionInstruction
         const ixs = registerResponse.instructions.map((ix) => ({

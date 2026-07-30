@@ -347,9 +347,9 @@ export class DeltaNeutralController {
     for (const acc of limitAccounts) {
       const units = await acc.service.getPositionBaseUnits(srcToken);
       totalLimitBaseUnits += units;
-      console.log(`  📐 ${shortAddr(acc.address)} limit position: ${units.toFixed(6)} ${srcToken}`);
+      console.log(`  📐 ${shortAddr(acc.address)} limit position: ${parseFloat(units.toFixed(6))} ${srcToken}`);
     }
-    console.log(`  📐 Total LIMIT side: ${totalLimitBaseUnits.toFixed(6)} ${srcToken} — MARKET side must match`);
+    console.log(`  📐 Total LIMIT side: ${parseFloat(totalLimitBaseUnits.toFixed(6))} ${srcToken} — MARKET side must match`);
 
     // Distribute lots proportionally among followers
     const totalFollowerWeight = marketAccounts.reduce((s, a) => s + (a.orderAmount ?? 1), 0);

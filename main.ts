@@ -142,19 +142,61 @@ async function runDeltaNeutral(services: PhoenixService[]): Promise<void> {
 async function closeAllPositions(services: PhoenixService[]): Promise<void> {
   console.log('\n🔄 Closing all positions and orders...');
 
+  const lines: string[] = ['📂 POSITIONS CLOSED | Force close', ''];
+  let totalPnl = 0;
+  let totalVolume = 0;
+
   for (const service of services) {
     const addr = shortAddr(service.getAddress());
     try {
+      const balanceBefore = await service.getUsdcBalance();
+      const positions = await service.getOpenPositionSummaries();
+      const volume = positions.reduce((s, p) => s + p.positionUsd, 0);
+      // Dominant side by USD size (for the TG line)
+      const side = positions.length
+        ? [...positions].sort((a, b) => b.positionUsd - a.positionUsd)[0]!.side
+        : null;
+
       console.log(`  📋 ${addr} — closing...`);
       await service.closeAllPositionsAndOrders();
-      console.log(`  ✅ ${addr} — done`);
+
+      const balanceAfter = await service.getUsdcBalance();
+      const pnl = balanceAfter - balanceBefore;
+      totalPnl += pnl;
+      totalVolume += volume;
+
+      if (side) {
+        const emoji = side === 'long' ? '🟢' : '🔴';
+        const sideLabel = side === 'long' ? 'LONG' : 'SHORT';
+        const pnlSign = pnl >= 0 ? '+' : '';
+        const pnlEmoji = pnl >= 0 ? '📈' : '📉';
+        const line =
+          `${emoji} ${sideLabel} ${addr} | ${pnlEmoji} PnL: ${pnlSign}${pnl.toFixed(4)}$ | ` +
+          `Bal: $${balanceAfter.toFixed(2)} | Vol: $${volume.toFixed(2)}`;
+        console.log(`  ✅ ${line}`);
+        lines.push(line);
+      } else {
+        console.log(`  ✅ ${addr} — no open positions`);
+        lines.push(`⚪ ${addr} | no open positions | Bal: $${balanceAfter.toFixed(2)}`);
+      }
     } catch (e: any) {
       console.log(`  ❌ ${addr} — failed: ${e.message}`);
+      lines.push(`❌ ${addr} | error: ${e.message}`);
     }
   }
 
+  const costPer100k = totalVolume > 0 ? (-totalPnl / totalVolume) * 100_000 : 0;
+  const pnlSign = totalPnl >= 0 ? '+' : '';
+  const totalEmoji = totalPnl >= 0 ? '📈' : '📉';
+
+  lines.push('');
+  lines.push(`${totalEmoji} Total PnL: ${pnlSign}${totalPnl.toFixed(4)}$`);
+  lines.push(`💰 Total Volume: $${totalVolume.toFixed(2)}`);
+  lines.push(` Cost per 100k: ${costPer100k.toFixed(3)}$`);
+
   console.log('\n✅ Close-all complete');
-  await sendTg(`CLOSE ALL | ${services.length} wallet(s) processed`);
+  console.log(lines.join('\n'));
+  await sendTg(lines.join('\n'));
 }
 
 // ==================== MODE 3: CHECK BALANCES ====================

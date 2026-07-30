@@ -242,75 +242,28 @@ export class PhoenixService {
 
     console.log(`  📝 [${this.walletAddress.slice(0, 6)}] Registering trader on Phoenix...`);
 
-    // Get sponsorship fee payer first — needed for both buildRegister and tx compilation
-    let sponsorFeePayer: string | null = null;
-    try {
-      const { payers } = await this.apiClient.getFeePayers();
-      if (payers && payers.length > 0) {
-        sponsorFeePayer = payers[Math.floor(Math.random() * payers.length)];
-      }
-    } catch { /* no sponsorship available */ }
-
     const registerResponse = await this.apiClient.buildRegisterInstructions({
       traderAuthority: this.walletAddress,
-      txFeePayer: sponsorFeePayer ?? this.walletAddress,
+      txFeePayer: this.walletAddress,
     });
 
     if (registerResponse.includeRegisterTrader && registerResponse.instructions.length > 0) {
       try {
-        if (!sponsorFeePayer) {
-          throw new Error('No sponsored fee payers available for registration');
-        }
-        const feePayer = sponsorFeePayer;
-
-        // Convert instructions to legacy TransactionInstruction
-        const ixs = registerResponse.instructions.map((ix) => ({
-          programId: new PublicKey(ix.programId),
-          keys: ix.keys.map((key) => ({
-            pubkey: new PublicKey(key.pubkey),
-            isSigner: key.isSigner,
-            isWritable: key.isWritable,
-          })),
-          data: Buffer.from(ix.data),
-        }));
-
-        const { blockhash } = await this.connection.getLatestBlockhash('confirmed');
-        const slot = await this.connection.getSlot('confirmed');
-
-        const messageV0 = new TransactionMessage({
-          payerKey: new PublicKey(feePayer),
-          recentBlockhash: blockhash,
-          instructions: ixs,
-        }).compileToV0Message();
-
-        const transaction = new VersionedTransaction(messageV0);
-        transaction.sign([this.wallet]);
-
-        const serialized = transaction.serialize();
-        const serializedTx = Buffer.from(serialized).toString('base64');
-
-        // Extract wallet signature
-        const staticKeys = (transaction.message as any).staticAccountKeys as PublicKey[];
-        const walletIndex = staticKeys.findIndex((k: any) => k.equals(this.wallet.publicKey));
-        const walletSignature = walletIndex >= 0 ? transaction.signatures[walletIndex] : null;
-        const userSignature = walletSignature ? base58.encode(walletSignature) : '';
-
-        const result = await this.apiClient.submitSponsoredTransaction({
-          userPubkey: this.walletAddress,
-          transaction: serializedTx,
-          userSignature,
-          slot: slot.toString(),
-        });
-
-        console.log(`  ✅ [${this.walletAddress.slice(0, 6)}] Trader registered (sponsored) | tx: ${result.signature}`);
+        const txHash = await this.buildSignAndSendTransaction(registerResponse.instructions);
+        console.log(`  ✅ [${this.walletAddress.slice(0, 6)}] Trader registered | tx: ${txHash}`);
         this.traderPda = registerResponse.traderPda;
       } catch (e: any) {
         const msg = e?.message ?? String(e);
-        // Fallback: check if registration already landed
+        if (msg.includes('insufficient lamports')) {
+          const match = msg.match(/need (\d+)/);
+          const needSol = match ? (parseInt(match[1]!) / 1e9).toFixed(3) : '0.04';
+          throw new Error(`Not enough SOL (need ~${needSol} SOL). Send SOL to this wallet first.`);
+        }
+        // On any error, check if registration landed anyway
         try {
           const recheck = await this.apiClient.getTraderState(this.walletAddress);
           if (recheck.snapshot?.capabilities?.state) {
-            console.log(`  ✅ [${this.walletAddress.slice(0, 6)}] Already registered on-chain`);
+            console.log(`  ✅ [${this.walletAddress.slice(0, 6)}] Registration confirmed on-chain`);
             this.traderPda = recheck.authority;
           } else {
             throw new Error(`Registration failed: ${msg}`);

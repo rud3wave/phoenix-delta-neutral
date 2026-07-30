@@ -7,6 +7,7 @@ import {
   createPhoenixClient,
   Side,
   buildAcceptEscrowRequestIx,
+  buildDepositFlow,
   getPhoenixEscrowAddress,
   getPhoenixTraderSubaccountAddress,
   PHOENIX_PROGRAM_ADDRESS,
@@ -969,6 +970,108 @@ export class PhoenixService {
       // Sponsorship already submitted; confirmation can lag
     });
     return result.signature;
+  }
+
+  // ==================== DEPOSIT ====================
+
+  private static readonly USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+
+  /**
+   * Get the wallet's USDC SPL token balance (on-chain wallet, NOT exchange).
+   */
+  public async getWalletUsdcBalance(): Promise<number> {
+    const tokenAccounts = await this.connection.getParsedTokenAccountsByOwner(
+      this.wallet.publicKey,
+      { mint: new PublicKey(PhoenixService.USDC_MINT) }
+    );
+
+    if (tokenAccounts.value.length === 0) return 0;
+
+    const parsed = tokenAccounts.value[0]!.account.data as any;
+    const uiAmount = parsed?.parsed?.info?.tokenAmount?.uiAmount ?? 0;
+    return uiAmount as number;
+  }
+
+  /**
+   * Deposit all USDC from the wallet to the Phoenix exchange account.
+   * Returns the amount deposited (0 if nothing to deposit).
+   */
+  public async depositUsdc(): Promise<{ deposited: number; txHash: string | null }> {
+    const tag = this.walletAddress.slice(0, 6);
+    const walletBalance = await this.getWalletUsdcBalance();
+
+    if (walletBalance <= 0.01) {
+      console.log(`  ℹ️ [${tag}] No USDC on wallet to deposit`);
+      return { deposited: 0, txHash: null };
+    }
+
+    console.log(`  💰 [${tag}] Wallet USDC: $${walletBalance.toFixed(2)} — depositing to exchange...`);
+
+    // Amount in micro-USDC (6 decimals), leave 0.01 for safety
+    const depositAmount = Math.floor((walletBalance - 0.01) * 1e6);
+    if (depositAmount <= 0) {
+      console.log(`  ℹ️ [${tag}] Balance too small to deposit`);
+      return { deposited: 0, txHash: null };
+    }
+
+    const client = createPhoenixClient({
+      apiUrl: PHOENIX_API_URL,
+      rpcUrl: this.connection.rpcEndpoint,
+      auth: false,
+      ws: false,
+      exchangeMetadata: { stream: false },
+    });
+
+    try {
+      const flow = await buildDepositFlow(
+        {
+          authority: this.walletAddress as any,
+          amount: BigInt(depositAmount),
+        },
+        client as any
+      );
+
+      // Convert kit instructions to legacy TransactionInstruction
+      const ixs = flow.instructions.map((ix: any) => {
+        const programId = new PublicKey(ix.programAddress ?? ix.programId?.toString() ?? '');
+        const keys = (ix.accounts ?? ix.keys ?? []).map((k: any) => ({
+          pubkey: new PublicKey(k.address ?? k.pubkey?.toString() ?? k.pubkey ?? ''),
+          isSigner: k.role === 2 || k.role === 3 || k.isSigner === true,
+          isWritable: k.role === 1 || k.role === 3 || k.isWritable === true,
+        }));
+        const data = Buffer.from(ix.data ?? new Uint8Array());
+        return new TransactionInstruction({ programId, keys, data });
+      });
+
+      await sleep(1 + Math.random());
+
+      const { blockhash } = await this.connection.getLatestBlockhash('confirmed');
+
+      const messageV0 = new TransactionMessage({
+        payerKey: this.wallet.publicKey,
+        recentBlockhash: blockhash,
+        instructions: ixs,
+      }).compileToV0Message();
+
+      const transaction = new VersionedTransaction(messageV0);
+      transaction.sign([this.wallet]);
+
+      const txHash = await this.connection.sendTransaction(transaction, {
+        skipPreflight: false,
+        preflightCommitment: 'confirmed',
+      });
+
+      await this.waitForConfirmation(txHash);
+
+      const depositedUsd = depositAmount / 1e6;
+      console.log(`  ✅ [${tag}] Deposited $${depositedUsd.toFixed(2)} to exchange | tx: ${txHash}`);
+      return { deposited: depositedUsd, txHash };
+    } catch (e: any) {
+      console.log(`  ⚠️ [${tag}] Deposit failed: ${e.message}`);
+      return { deposited: 0, txHash: null };
+    } finally {
+      client.dispose();
+    }
   }
 
   // ==================== TRANSACTION BUILDING ====================

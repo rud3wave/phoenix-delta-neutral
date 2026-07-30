@@ -126,25 +126,25 @@ npm start
 
 **Сообщение #1 — Позиции открыты**
 ```
-POSITIONS OPENED | Group 482913
-ETH | Spread: 0.0100% | Mid: $3450.25
+📂 POSITIONS OPENED | Group 482913
+📊 ETH | Spread: 0.0100% | Mid: $3450.25
 
-LONG AbCd...WxYz | $150.00 | Lev: 10.2x | Liq: 45.3%
-SHORT IjKl...StUv | $270.00 | Lev: 9.1x | Liq: 48.7%
+🟢 LONG AbCd...WxYz | $150.00 | Lev: 10.2x | Liq: 45.3%
+🔴 SHORT IjKl...StUv | $270.00 | Lev: 9.1x | Liq: 48.7%
 
-LONG: $270.00 | SHORT: $270.00
+🟢 LONG: $270.00 | 🔴 SHORT: $270.00
 ```
 
 **Сообщение #2 — Позиции закрыты**
 ```
-POSITIONS CLOSED | Group 482913
+📂 POSITIONS CLOSED | Group 482913
 
-LONG AbCd...WxYz | PnL: -0.0523$ | Bal: $195.42 | Vol: $150.00
-SHORT IjKl...StUv | PnL: +0.0105$ | Bal: $230.15 | Vol: $270.00
+🟢 LONG AbCd...WxYz | 📉 PnL: -0.0523$ | Bal: $195.42 | Vol: $150.00
+🔴 SHORT IjKl...StUv | 📈 PnL: +0.0105$ | Bal: $230.15 | Vol: $270.00
 
-Total PnL: -0.0830$
-Total Volume: $540.00
-Cost per 100k: 15.370$
+📉 Total PnL: -0.0830$
+💰 Total Volume: $540.00
+ Cost per 100k: 15.370$
 ```
 
 ---

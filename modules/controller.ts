@@ -393,11 +393,11 @@ export class DeltaNeutralController {
     // ========== TG #1: POSITIONS OPENED ==========
     {
       const lines: string[] = [];
-      lines.push(`POSITIONS OPENED | Group ${id}`);
+      lines.push(`📂 POSITIONS OPENED | Group ${id}`);
 
       try {
         const snap = await accounts[0]!.service.getMarketSnapshot(srcToken);
-        lines.push(`${srcToken} | Spread: ${snap.spreadPercent.toFixed(4)}% | Mid: $${snap.midPrice.toFixed(2)}`);
+        lines.push(`📊 ${srcToken} | Spread: ${snap.spreadPercent.toFixed(4)}% | Mid: $${snap.midPrice.toFixed(2)}`);
       } catch {
         lines.push(srcToken);
       }
@@ -406,21 +406,23 @@ export class DeltaNeutralController {
       for (const acc of accounts) {
         try {
           const liq = await acc.service.getPositionWithLiquidation(srcToken);
+          const emoji = acc.side === 'long' ? '🟢' : '🔴';
           const side = acc.side === 'long' ? 'LONG' : 'SHORT';
           lines.push(
-            `${side} ${shortAddr(acc.address)} | $${liq.positionUsd.toFixed(2)} | ` +
+            `${emoji} ${side} ${shortAddr(acc.address)} | $${liq.positionUsd.toFixed(2)} | ` +
             `Lev: ${liq.effectiveLeverage.toFixed(1)}x | ` +
             `Liq: ${liq.liqDistancePercent.toFixed(1)}%`
           );
         } catch {
-          lines.push(`${acc.side === 'long' ? 'LONG' : 'SHORT'} ${shortAddr(acc.address)} | error`);
+          const emoji = acc.side === 'long' ? '🟢' : '🔴';
+          lines.push(`${emoji} ${acc.side === 'long' ? 'LONG' : 'SHORT'} ${shortAddr(acc.address)} | error`);
         }
       }
 
       const longTotal = accounts.filter((a) => a.side === 'long').reduce((s, a) => s + (a.orderAmount ?? 0), 0);
       const shortTotal = accounts.filter((a) => a.side === 'short').reduce((s, a) => s + (a.orderAmount ?? 0), 0);
       lines.push('');
-      lines.push(`LONG: $${longTotal.toFixed(2)} | SHORT: $${shortTotal.toFixed(2)}`);
+      lines.push(`🟢 LONG: $${longTotal.toFixed(2)} | 🔴 SHORT: $${shortTotal.toFixed(2)}`);
 
       await sendTg(lines.join('\n'));
     }
@@ -484,7 +486,7 @@ export class DeltaNeutralController {
     // ========== TG #2: POSITIONS CLOSED + PnL ==========
     {
       const lines: string[] = [];
-      lines.push(`POSITIONS CLOSED | Group ${id}`);
+      lines.push(`📂 POSITIONS CLOSED | Group ${id}`);
       lines.push('');
 
       let totalPnl = 0;
@@ -498,24 +500,28 @@ export class DeltaNeutralController {
           totalPnl += pnl;
           totalVolume += acc.orderAmount ?? 0;
 
+          const emoji = acc.side === 'long' ? '🟢' : '🔴';
           const side = acc.side === 'long' ? 'LONG' : 'SHORT';
           const pnlSign = pnl >= 0 ? '+' : '';
+          const pnlEmoji = pnl >= 0 ? '📈' : '📉';
           lines.push(
-            `${side} ${shortAddr(acc.address)} | PnL: ${pnlSign}${pnl.toFixed(4)}$ | ` +
+            `${emoji} ${side} ${shortAddr(acc.address)} | ${pnlEmoji} PnL: ${pnlSign}${pnl.toFixed(4)}$ | ` +
             `Bal: $${bal.toFixed(2)} | Vol: $${(acc.orderAmount ?? 0).toFixed(2)}`
           );
         } catch {
-          lines.push(`${acc.side === 'long' ? 'LONG' : 'SHORT'} ${shortAddr(acc.address)} | error`);
+          const emoji = acc.side === 'long' ? '🟢' : '🔴';
+          lines.push(`${emoji} ${acc.side === 'long' ? 'LONG' : 'SHORT'} ${shortAddr(acc.address)} | error`);
         }
       }
 
       const costPer100k = totalVolume > 0 ? (-totalPnl / totalVolume) * 100000 : 0;
       const pnlSign = totalPnl >= 0 ? '+' : '';
+      const totalEmoji = totalPnl >= 0 ? '📈' : '📉';
 
       lines.push('');
-      lines.push(`Total PnL: ${pnlSign}${totalPnl.toFixed(4)}$`);
-      lines.push(`Total Volume: $${totalVolume.toFixed(2)}`);
-      lines.push(`Cost per 100k: ${costPer100k.toFixed(3)}$`);
+      lines.push(`${totalEmoji} Total PnL: ${pnlSign}${totalPnl.toFixed(4)}$`);
+      lines.push(`💰 Total Volume: $${totalVolume.toFixed(2)}`);
+      lines.push(` Cost per 100k: ${costPer100k.toFixed(3)}$`);
 
       await sendTg(lines.join('\n'));
     }

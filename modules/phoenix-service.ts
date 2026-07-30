@@ -1129,9 +1129,11 @@ export class PhoenixService {
     const transaction = new VersionedTransaction(messageV0);
     transaction.sign([this.wallet]);
 
-    const txHash = await this.connection.sendTransaction(transaction, {
+    const rawTx = transaction.serialize();
+    const txHash = await this.connection.sendRawTransaction(rawTx, {
       skipPreflight: false,
       preflightCommitment: 'confirmed',
+      maxRetries: 5,
     });
 
     await this.waitForConfirmation(txHash);
@@ -1144,7 +1146,7 @@ export class PhoenixService {
   private async waitForConfirmation(
     signature: string,
     commitment: 'processed' | 'confirmed' | 'finalized' = 'confirmed',
-    timeout = 60_000,
+    timeout = 120_000,
     pollInterval = 3000
   ): Promise<void> {
     // Initial delay before first poll

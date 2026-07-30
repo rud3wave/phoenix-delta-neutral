@@ -34,7 +34,7 @@ export const LEVERAGE_RANGE: [number, number] = [7, 15];
 // ДОЛЖНО совпадать с количеством кошельков!
 // 3 кошелька → [2, 1] или [1, 2]
 // 5 кошельков → [3, 2] или [2, 3]
-export const GROUP_CONFIGS: [number, number][] = [[3, 2]];
+export const GROUP_CONFIGS: [number, number][] = [[1, 1]];
 
 // --- НАСТРОЙКИ ОРДЕРОВ ---
 

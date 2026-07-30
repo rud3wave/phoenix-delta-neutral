@@ -40,7 +40,7 @@ function askMode(): Promise<string> {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   return new Promise((resolve) => {
     rl.question(
-      `\nВыбери режим:\n  1 = Дельта-нейтральная торговля\n  2 = Закрыть все позиции\n  3 = Проверить балансы\n  4 = Клеймить награды\n\n> `,
+      `\nВыбери режим:\n  1 = Дельта-нейтральная торговля\n  2 = Закрыть все позиции\n  3 = Проверить балансы\n  4 = Клеймить награды\n  5 = Пополнить биржу с кошелька\n\n> `,
       (answer) => {
         rl.close();
         resolve(answer.trim());
@@ -208,6 +208,45 @@ async function claimRewards(services: PhoenixService[]): Promise<void> {
   await sendTg(lines.join('\n'));
 }
 
+// ==================== MODE 5: DEPOSIT USDC ====================
+
+async function depositUsdc(services: PhoenixService[]): Promise<void> {
+  console.log('\n💰 Depositing USDC from wallets to exchange...\n');
+
+  let totalDeposited = 0;
+  let depositCount = 0;
+  const lines: string[] = ['💰 Deposit USDC', ''];
+
+  for (const service of services) {
+    const addr = shortAddr(service.getAddress());
+    try {
+      const result = await service.depositUsdc();
+      if (result.deposited > 0) {
+        depositCount++;
+        totalDeposited += result.deposited;
+        lines.push(`✅ ${addr} | +$${result.deposited.toFixed(2)}`);
+      }
+    } catch (e: any) {
+      console.log(`  ⚠️ ${addr} | ${e.message}`);
+      lines.push(`⚠️ ${addr} | ${e.message}`);
+    }
+
+    if (services.indexOf(service) < services.length - 1) {
+      await sleep(1 + Math.random());
+    }
+  }
+
+  lines.push('', `Deposited: $${totalDeposited.toFixed(2)} from ${depositCount}/${services.length} wallet(s)`);
+
+  if (depositCount > 0) {
+    console.log(`\n✅ Deposited $${totalDeposited.toFixed(2)} from ${depositCount}/${services.length} wallet(s)`);
+  } else {
+    console.log('\nℹ️ Nothing to deposit');
+  }
+
+  await sendTg(lines.join('\n'));
+}
+
 // ==================== GRACEFUL SHUTDOWN ====================
 
 let controllerRef: DeltaNeutralController | null = null;
@@ -273,8 +312,11 @@ async function main(): Promise<void> {
       case '4':
         await claimRewards(services);
         break;
+      case '5':
+        await depositUsdc(services);
+        break;
       default:
-        console.log(`\n❌ Неизвестный режим: "${mode}". Выбери 1, 2, 3 или 4.`);
+        console.log(`\n❌ Неизвестный режим: "${mode}". Выбери 1, 2, 3, 4 или 5.`);
         process.exit(1);
     }
   } catch (e: any) {

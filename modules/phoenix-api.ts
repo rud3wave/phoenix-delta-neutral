@@ -321,6 +321,23 @@ export interface BuildRegisterResponse {
   txFeePayer: string;
 }
 
+export interface SendRegisterIxsRequest {
+  transaction: string;
+  traderAuthority: string;
+  txFeePayer: string;
+  maxPositions?: number;
+  traderPdaIndex?: number;
+  traderSubaccountIndex?: number;
+}
+
+export interface SendRegisterIxsResponse {
+  signature: string;
+  traderPda: string;
+  traderOnboarder: string;
+  txFeePayer: string;
+  maxPositions: number;
+}
+
 // --- REFERRAL ---
 
 export interface ValidateInviteRequest {
@@ -542,6 +559,13 @@ export class PhoenixApiClient {
       json: req,
     });
     return this.extractBody<BuildRegisterResponse>(res);
+  }
+
+  public async sendRegisterIxs(req: SendRegisterIxsRequest): Promise<SendRegisterIxsResponse> {
+    const res = await this.session.post(`${PHOENIX_API_URL}/v1/exchange/send-register-ixs`, {
+      json: req,
+    });
+    return this.extractBody<SendRegisterIxsResponse>(res);
   }
 
   // ==================== REFERRAL ====================

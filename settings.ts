@@ -21,9 +21,16 @@ export const TOKENS_TO_TRADE = ['ETH'];
 
 // --- НАСТРОЙКИ ПОЗИЦИЙ ---
 
-// Маржа (сколько баланса задействовать на позицию в USD)
-// [мин, макс] — рандомное значение из диапазона
-export const MARGIN_RANGE: [number, number] = [250, 350];
+// Как считать маржу:
+// 'percent' — % от баланса кошелька
+// 'usdc'    — фиксированная сумма в долларах
+export const MARGIN_MODE = 'percent'; // или 'usdc'
+
+// [мин, макс] — рандом из диапазона
+// при 'percent': [50, 60] = 50–60% баланса
+// при 'usdc':    [250, 350] = $250–350
+export const MARGIN_RANGE: [number, number] = [50, 60];
+// export const MARGIN_RANGE: [number, number] = [250, 350]; // для usdc
 
 // Плечо (множитель)
 // [мин, макс] — рандомное значение из диапазона

@@ -142,17 +142,12 @@ async function runDeltaNeutral(services: PhoenixService[]): Promise<void> {
 async function closeAllPositions(services: PhoenixService[]): Promise<void> {
   console.log('\n🔄 Closing all positions and orders...');
 
-  const lines: string[] = ['📂 POSITIONS CLOSED | Force close', ''];
-  let totalPnl = 0;
-  let totalVolume = 0;
-
-  for (const service of services) {
+  const results = await Promise.all(services.map(async (service) => {
     const addr = shortAddr(service.getAddress());
     try {
       const balanceBefore = await service.getUsdcBalance();
       const positions = await service.getOpenPositionSummaries();
       const volume = positions.reduce((s, p) => s + p.positionUsd, 0);
-      // Dominant side by USD size (for the TG line)
       const side = positions.length
         ? [...positions].sort((a, b) => b.positionUsd - a.positionUsd)[0]!.side
         : null;
@@ -162,8 +157,6 @@ async function closeAllPositions(services: PhoenixService[]): Promise<void> {
 
       const balanceAfter = await service.getUsdcBalance();
       const pnl = balanceAfter - balanceBefore;
-      totalPnl += pnl;
-      totalVolume += volume;
 
       if (side) {
         const emoji = side === 'long' ? '🟢' : '🔴';
@@ -174,15 +167,24 @@ async function closeAllPositions(services: PhoenixService[]): Promise<void> {
           `${emoji} ${sideLabel} ${addr} | ${pnlEmoji} PnL: ${pnlSign}${pnl.toFixed(4)}$ | ` +
           `Bal: $${balanceAfter.toFixed(2)} | Vol: $${volume.toFixed(2)}`;
         console.log(`  ✅ ${line}`);
-        lines.push(line);
+        return { line, pnl, volume };
       } else {
         console.log(`  ✅ ${addr} — no open positions`);
-        lines.push(`⚪ ${addr} | no open positions | Bal: $${balanceAfter.toFixed(2)}`);
+        return { line: `⚪ ${addr} | no open positions | Bal: $${balanceAfter.toFixed(2)}`, pnl: 0, volume: 0 };
       }
     } catch (e: any) {
       console.log(`  ❌ ${addr} — failed: ${e.message}`);
-      lines.push(`❌ ${addr} | error: ${e.message}`);
+      return { line: `❌ ${addr} | error: ${e.message}`, pnl: 0, volume: 0 };
     }
+  }));
+
+  const lines: string[] = ['📂 POSITIONS CLOSED | Force close', ''];
+  let totalPnl = 0;
+  let totalVolume = 0;
+  for (const r of results) {
+    lines.push(r.line);
+    totalPnl += r.pnl;
+    totalVolume += r.volume;
   }
 
   const costPer100k = totalVolume > 0 ? (-totalPnl / totalVolume) * 100_000 : 0;
@@ -204,21 +206,21 @@ async function closeAllPositions(services: PhoenixService[]): Promise<void> {
 async function checkBalances(services: PhoenixService[]): Promise<void> {
   console.log('\n💰 Checking balances...\n');
 
-  let totalBalance = 0;
-  const lines: string[] = ['💰 Checked balances', ''];
-
-  for (const service of services) {
+  const results = await Promise.all(services.map(async (service) => {
     const addr = shortAddr(service.getAddress());
     try {
       const balance = await service.getUsdcBalance();
-      totalBalance += balance;
       console.log(`  ✅ ${addr} | $${balance.toFixed(2)}`);
-      lines.push(`✅ ${addr} | $${balance.toFixed(2)}`);
+      return { line: `✅ ${addr} | $${balance.toFixed(2)}`, balance };
     } catch (e: any) {
       console.log(`  ${addr} | error: ${e.message}`);
-      lines.push(`${addr} | error`);
+      return { line: `${addr} | error`, balance: 0 };
     }
-  }
+  }));
+
+  const totalBalance = results.reduce((s, r) => s + r.balance, 0);
+  const lines: string[] = ['💰 Checked balances', ''];
+  for (const r of results) lines.push(r.line);
 
   console.log(`\n  💎 Total: $${totalBalance.toFixed(2)} across ${services.length} wallet(s)`);
   lines.push('', `💎 Total: $${totalBalance.toFixed(2)} across ${services.length} wallet(s)`);
@@ -230,29 +232,28 @@ async function checkBalances(services: PhoenixService[]): Promise<void> {
 async function claimRewards(services: PhoenixService[]): Promise<void> {
   console.log('\n🎁 Claiming rewards...\n');
 
-  let claimedCount = 0;
-  let totalClaimed = 0;
-  const lines: string[] = ['🎁 Claiming rewards', ''];
-
-  for (const service of services) {
+  const results = await Promise.all(services.map(async (service) => {
     const addr = shortAddr(service.getAddress());
     try {
       const result = await service.claimRewards();
       if (result.claimed) {
-        claimedCount++;
-        totalClaimed += result.amountUsd;
-        lines.push(`✅ ${addr} | +$${result.amountUsd.toFixed(2)}`);
+        return { line: `✅ ${addr} | +$${result.amountUsd.toFixed(2)}`, claimed: true, amount: result.amountUsd };
       } else {
         console.log(`  ℹ️ ${addr} | Nothing to claim`);
+        return { line: '', claimed: false, amount: 0 };
       }
     } catch (e: any) {
       console.log(`  ⚠️ ${addr} | ${e.message}`);
-      lines.push(`⚠️ ${addr} | ${e.message}`);
+      return { line: `⚠️ ${addr} | ${e.message}`, claimed: false, amount: 0 };
     }
+  }));
 
-    if (services.indexOf(service) < services.length - 1) {
-      await sleep(1 + Math.random());
-    }
+  const lines: string[] = ['🎁 Claiming rewards', ''];
+  let claimedCount = 0;
+  let totalClaimed = 0;
+  for (const r of results) {
+    if (r.line) lines.push(r.line);
+    if (r.claimed) { claimedCount++; totalClaimed += r.amount; }
   }
 
   lines.push('', `Claimed: $${totalClaimed.toFixed(2)} from ${claimedCount}/${services.length} wallet(s)`);
@@ -271,27 +272,26 @@ async function claimRewards(services: PhoenixService[]): Promise<void> {
 async function depositUsdc(services: PhoenixService[]): Promise<void> {
   console.log('\n💰 Depositing USDC from wallets to exchange...\n');
 
-  let totalDeposited = 0;
-  let depositCount = 0;
-  const lines: string[] = ['💰 Deposit USDC', ''];
-
-  for (const service of services) {
+  const results = await Promise.all(services.map(async (service) => {
     const addr = shortAddr(service.getAddress());
     try {
       const result = await service.depositUsdc();
       if (result.deposited > 0) {
-        depositCount++;
-        totalDeposited += result.deposited;
-        lines.push(`✅ ${addr} | +$${result.deposited.toFixed(2)}`);
+        return { line: `✅ ${addr} | +$${result.deposited.toFixed(2)}`, deposited: result.deposited };
       }
+      return { line: '', deposited: 0 };
     } catch (e: any) {
       console.log(`  ⚠️ ${addr} | ${e.message}`);
-      lines.push(`⚠️ ${addr} | ${e.message}`);
+      return { line: `⚠️ ${addr} | ${e.message}`, deposited: 0 };
     }
+  }));
 
-    if (services.indexOf(service) < services.length - 1) {
-      await sleep(1 + Math.random());
-    }
+  const lines: string[] = ['💰 Deposit USDC', ''];
+  let totalDeposited = 0;
+  let depositCount = 0;
+  for (const r of results) {
+    if (r.line) lines.push(r.line);
+    if (r.deposited > 0) { depositCount++; totalDeposited += r.deposited; }
   }
 
   lines.push('', `Deposited: $${totalDeposited.toFixed(2)} from ${depositCount}/${services.length} wallet(s)`);

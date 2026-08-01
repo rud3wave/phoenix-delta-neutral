@@ -10,8 +10,6 @@
 import {
   GROUP_CONFIGS,
   LEVERAGE_RANGE,
-  MARGIN_MODE,
-  MARGIN_RANGE,
   MAX_SPREAD,
   LIMIT_FILL_TIMEOUT_MINUTES,
   CLOSE_LIMIT_TIMEOUT_MINUTES,
@@ -34,17 +32,6 @@ import {
   shuffleArray,
   shortAddr,
 } from './utils.js';
-
-// ==================== HELPERS ====================
-
-/** Resolve MARGIN_RANGE value to USDC based on MARGIN_MODE. */
-function resolveMargin(balanceUsd: number, rangeValue: number): number {
-  if (MARGIN_MODE === 'percent') {
-    const pct = Math.min(Math.max(rangeValue, 0), 100);
-    return balanceUsd * (pct / 100);
-  }
-  return rangeValue;
-}
 
 // ==================== TYPES ====================
 
@@ -169,13 +156,10 @@ export class DeltaNeutralController {
           }
         }
 
-        // Validate balances can cover min margin
-        const canCover = selected.every((acc) => {
-          const minMargin = resolveMargin(acc.balance, MARGIN_RANGE[0]);
-          return acc.balance * 0.99 >= minMargin && minMargin > 0;
-        });
+        // Validate balances are sufficient (need at least $1 to trade)
+        const canCover = selected.every((acc) => acc.balance >= 1);
         if (!canCover) {
-          console.log('  ⚠️ Some wallets cannot cover min margin. Returning to pool.');
+          console.log('  ⚠️ Some wallets have insufficient balance. Returning to pool.');
           this.pool = [...remaining, ...selected];
           await sleep(10);
           continue;
@@ -344,14 +328,16 @@ export class DeltaNeutralController {
   /**
    * Try to compute a balanced allocation where LONG notional == SHORT notional exactly.
    *
-   * Source side (fewer wallets, larger balances) gets random margin + leverage.
+   * Formula: notional = balance × leverage (cross margin — full balance = collateral).
+   * Effective leverage on website = notional / balance = leverage. Matches settings.
+   *
+   * Source side (fewer wallets, larger balances) gets random leverage from LEVERAGE_RANGE.
    * Target side (more wallets, smaller balances) is derived to match source total.
    *
    * Returns true on success, false if factorization failed (caller should retry).
    */
   private tryCalculateAllocation(accounts: GroupAccount[], longCount: number): boolean {
     const [minLev, maxLev] = LEVERAGE_RANGE;
-    const [minMarginParam, maxMarginParam] = MARGIN_RANGE;
 
     // Sort by balance descending — larger balances first
     const sorted = [...accounts].sort((a, b) => b.balance - a.balance);
@@ -364,41 +350,37 @@ export class DeltaNeutralController {
     const sourceAccounts = sorted.slice(0, sourceCount);
     const targetAccounts = sorted.slice(sourceCount);
 
-    // --- Source side: fully random ---
-    const sourceData: { account: GroupAccount; margin: number; leverage: number; notional: number }[] = [];
+    // --- Source side: notional = balance × random_leverage ---
+    const sourceData: { account: GroupAccount; leverage: number; notional: number }[] = [];
     let targetNotional = 0;
 
     for (const acc of sourceAccounts) {
       const leverage = getRandomNumber(LEVERAGE_RANGE);
-      const safeBalance = acc.balance * 0.99;
-      const margin = Math.min(resolveMargin(acc.balance, getRandomNumber(MARGIN_RANGE)), safeBalance);
-      const notional = margin * leverage;
+      const notional = acc.balance * leverage;
 
-      if (margin <= 0 || notional <= 0) return false;
+      if (notional <= 0) return false;
 
-      sourceData.push({ account: acc, margin, leverage, notional });
+      sourceData.push({ account: acc, leverage, notional });
       targetNotional += notional;
     }
 
     // --- Target side: derived to match ---
-
-    // Compute per-wallet notional capacity on target side
-    const targetCaps = targetAccounts.map((acc) => {
-      const safeBalance = acc.balance * 0.99;
-      const maxMargin = MARGIN_MODE === 'percent'
-        ? safeBalance * (Math.min(maxMarginParam, 100) / 100)
-        : Math.min(maxMarginParam, safeBalance);
-      return { account: acc, minCap: 0.01, maxCap: maxMargin * maxLev };
-    });
+    // Each target wallet's capacity = balance × maxLev (max notional it can carry)
+    const targetCaps = targetAccounts.map((acc) => ({
+      account: acc,
+      minCap: acc.balance * minLev,
+      maxCap: acc.balance * maxLev,
+    }));
 
     const totalMinCap = targetCaps.reduce((s, c) => s + c.minCap, 0);
     const totalMaxCap = targetCaps.reduce((s, c) => s + c.maxCap, 0);
     if (targetNotional < totalMinCap || targetNotional > totalMaxCap) return false;
 
-    // Distribute targetNotional proportionally, clamped to caps
+    // Distribute targetNotional proportionally to capacity
     const rawWeights = targetCaps.map((c) => c.maxCap);
     const totalWeight = rawWeights.reduce((s, w) => s + w, 0);
-    const notionalParts = this.distributeNotional(
+
+    let parts: number[] | null = this.distributeNotional(
       targetNotional,
       targetCount,
       Math.max(...targetCaps.map((c) => c.minCap)),
@@ -406,7 +388,6 @@ export class DeltaNeutralController {
     );
 
     // If uniform min/max doesn't work, try proportional distribution
-    let parts: number[] | null = notionalParts;
     if (!parts) {
       parts = [];
       let allocated = 0;
@@ -423,54 +404,27 @@ export class DeltaNeutralController {
       parts.push(last);
     }
 
-    // For each target wallet: find margin + leverage such that margin * leverage == part
-    const targetData: { account: GroupAccount; margin: number; leverage: number; notional: number }[] = [];
+    // For each target wallet: leverage = notional_part / balance
+    const targetData: { account: GroupAccount; leverage: number; notional: number }[] = [];
 
     for (let i = 0; i < targetCount; i++) {
       const acc = targetAccounts[i]!;
       const part = parts[i]!;
-      const safeBalance = acc.balance * 0.99;
 
-      // Compute valid margin range so leverage stays in [minLev, maxLev]
-      // leverage = part / margin → margin = part / leverage
-      // For leverage ∈ [minLev, maxLev]: margin ∈ [part/maxLev, part/minLev]
-      let marginLow = part / maxLev;
-      let marginHigh = part / minLev;
-
-      // Clamp to balance constraints
-      if (MARGIN_MODE === 'percent') {
-        const absMinMargin = safeBalance * (Math.max(minMarginParam, 0) / 100);
-        const absMaxMargin = safeBalance * (Math.min(maxMarginParam, 100) / 100);
-        marginLow = Math.max(marginLow, absMinMargin);
-        marginHigh = Math.min(marginHigh, absMaxMargin);
-      } else {
-        marginLow = Math.max(marginLow, minMarginParam);
-        marginHigh = Math.min(marginHigh, maxMarginParam, safeBalance);
-      }
-
-      if (marginLow > marginHigh || marginLow <= 0) return false;
-
-      const margin = marginLow + Math.random() * (marginHigh - marginLow);
-      const leverage = part / margin;
-
-      // Round leverage to 1 decimal (Phoenix accepts float leverage)
+      // Effective leverage = notional / balance
+      const leverage = part / acc.balance;
       const roundedLev = Math.round(leverage * 10) / 10;
+
       if (roundedLev < minLev || roundedLev > maxLev) return false;
 
-      targetData.push({ account: acc, margin, leverage: roundedLev, notional: part });
+      targetData.push({ account: acc, leverage: roundedLev, notional: part });
     }
 
     // --- Liquidation distance check ---
     if (MIN_LIQUIDATION_DISTANCE > 0) {
       const allData = [...sourceData, ...targetData];
       for (const d of allData) {
-        // Approximate liq distance: with cross margin, rough formula:
-        // liqDistance% ≈ (1 / effectiveLev) * 100 - maintenanceMargin%
-        // effectiveLev = notional / balance (since cross margin uses full balance)
-        const effectiveLev = d.notional / d.account.balance;
-        // Maintenance margin ~1% for most perps; liq when loss = balance
-        // loss% = 1/effectiveLev → liqDistance ≈ (1/effectiveLev)*100
-        const liqDistance = (1 / effectiveLev) * 100;
+        const liqDistance = (1 / d.leverage) * 100;
         if (liqDistance < MIN_LIQUIDATION_DISTANCE) return false;
       }
     }

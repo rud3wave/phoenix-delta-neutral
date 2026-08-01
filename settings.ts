@@ -16,22 +16,20 @@ export const SHUFFLE_WALLETS = true;
 export const RETRY = 3;
 
 // --- ТОКЕНЫ ДЛЯ ТОРГОВЛИ ---
-// Какие токены торговать на Phoenix (можно несколько, выберет рандомно)
+// Какие токены торговать на Phoenix.
+// Один токен  → ['ETH']         — все группы торгуют только ETH
+// Мульти режим → ['ETH', 'SOL', 'BTC'] — каждая группа рандомно выберет один из списка
 // Доступные: SOL, ETH, BTC
 export const TOKENS_TO_TRADE = ['ETH', 'SOL', 'BTC'];
 
 // --- НАСТРОЙКИ ПОЗИЦИЙ ---
 
-// Как считать маржу:
-// 'percent' — % от баланса кошелька
-// 'usdc'    — фиксированная сумма в долларах
-export const MARGIN_MODE = 'percent'; // или 'usdc'
-
-// [мин, макс] — рандом из диапазона
-// при 'percent': [50, 60] = 50–60% баланса
-// при 'usdc':    [250, 350] = $250–350
+// MARGIN_RANGE НЕ используется в расчёте позиций (cross margin).
+// В кросс-марже весь баланс = коллатераль, поэтому notional = balance × leverage.
+// Effective leverage на сайте = LEVERAGE_RANGE напрямую.
+// Оставлено для совместимости / будущих режимов.
+export const MARGIN_MODE = 'percent';
 export const MARGIN_RANGE: [number, number] = [50, 60];
-// export const MARGIN_RANGE: [number, number] = [250, 350]; // для usdc
 
 // Плечо (множитель) — effective leverage на сайте = balance × lev / balance = lev
 // [мин, макс] — рандомное значение из диапазона

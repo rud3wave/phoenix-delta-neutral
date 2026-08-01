@@ -251,14 +251,63 @@ export class DeltaNeutralController {
       console.log(`\n  ✅ Group ${group.id} cycle completed`);
     } catch (e: any) {
       console.log(`\n  ❌ Strategy failed: ${e.message}`);
-      console.log('  🚨 Emergency cleanup...');
+      console.log('  🚨 Emergency cleanup via LIMIT (maker)...');
 
+      // Close all via limit with retry loop (same as normal close)
+      const pendingCleanup = new Set(accounts);
+
+      // Initial limit placement
       for (const acc of accounts) {
         try {
-          await acc.service.closeAllPositionsAndOrders();
+          await acc.service.closePositionByLimit(srcToken);
         } catch {
           // best effort
         }
+      }
+
+      // Retry until all closed
+      while (pendingCleanup.size > 0) {
+        await sleep(CLOSE_LIMIT_TIMEOUT_MINUTES * 60);
+
+        const stillOpen: GroupAccount[] = [];
+        for (const acc of pendingCleanup) {
+          try {
+            const state = await acc.service.getPositions();
+            const subaccounts = state.snapshot?.subaccounts ?? [];
+            let hasPosition = false;
+            for (const sub of subaccounts) {
+              const positions = sub.positions ?? [];
+              if (positions.some((p) => p.symbol === srcToken && Number(p.basePositionLots) !== 0)) {
+                hasPosition = true;
+                break;
+              }
+            }
+            if (hasPosition) stillOpen.push(acc);
+          } catch {
+            stillOpen.push(acc);
+          }
+        }
+
+        for (const acc of pendingCleanup) {
+          if (!stillOpen.includes(acc)) pendingCleanup.delete(acc);
+        }
+
+        if (pendingCleanup.size === 0) break;
+
+        // Re-place unfilled
+        for (const acc of stillOpen) {
+          try {
+            await acc.service.cancelAllOrders(srcToken);
+            await acc.service.closePositionByLimit(srcToken);
+          } catch {
+            // best effort
+          }
+        }
+      }
+
+      console.log('  ✅ Emergency cleanup complete (maker)');
+
+      for (const acc of accounts) {
         acc.failures++;
       }
     }

@@ -512,19 +512,27 @@ export class DeltaNeutralController {
     const { accounts, groupConfig, id } = group;
     const [longCount] = groupConfig;
 
-    console.log(`\n  🎯 ALL ${accounts.length} wallets open via LIMIT (maker) simultaneously`);
+    // Determine leader side (biggest order = limit side)
+    const biggest = [...accounts].sort((a, b) => (b.orderAmount ?? 0) - (a.orderAmount ?? 0))[0]!;
+    const limitSide = biggest.side!;
+    const marketSide = limitSide === 'long' ? 'short' : 'long';
 
-    // ========== OPEN — ALL wallets simultaneously ==========
+    const limitAccounts = accounts.filter((a) => a.side === limitSide);
+    const marketAccounts = accounts.filter((a) => a.side === marketSide);
 
-    // Initial placement for ALL accounts
-    console.log(`\n  📋 Placing LIMIT orders on all ${accounts.length} wallets...`);
-    const pendingOpen = new Set(accounts);
+    console.log(`\n  🎯 LEADER: ${limitSide.toUpperCase()} (${limitAccounts.length}) via LIMIT | FOLLOWER: ${marketSide.toUpperCase()} (${marketAccounts.length}) via MARKET`);
 
-    await Promise.all(accounts.map(async (acc) => {
+    // ========== OPEN — Leader LIMIT + Follower MARKET ==========
+
+    // Leader places LIMIT orders (parallel)
+    console.log(`\n  📋 ${limitSide.toUpperCase()} placing LIMIT orders...`);
+    const pendingLeader = new Set(limitAccounts);
+
+    await Promise.all(limitAccounts.map(async (acc) => {
       try {
         await acc.service.placePositionOrder({
           instrument: srcToken,
-          executionSide: acc.side!,
+          executionSide: limitSide,
           executionType: 'limit',
           amountUsd: acc.orderAmount!,
           leverage: acc.leverage,
@@ -535,12 +543,12 @@ export class DeltaNeutralController {
       }
     }));
 
-    // Retry loop: every 10s check + re-place unfilled at fresh price
-    while (pendingOpen.size > 0) {
+    // Retry loop for leader: every 10s check + re-place unfilled
+    while (pendingLeader.size > 0) {
       await sleep(10);
 
       const stillWaiting: GroupAccount[] = [];
-      for (const acc of pendingOpen) {
+      for (const acc of pendingLeader) {
         try {
           const state = await acc.service.getPositions();
           const subaccounts = state.snapshot?.subaccounts ?? [];
@@ -553,7 +561,7 @@ export class DeltaNeutralController {
             }
           }
           if (hasPosition) {
-            console.log(`  ✅ ${shortAddr(acc.address)} ${acc.side!.toUpperCase()} limit FILLED`);
+            console.log(`  ✅ ${shortAddr(acc.address)} leader FILLED`);
           } else {
             stillWaiting.push(acc);
           }
@@ -562,36 +570,70 @@ export class DeltaNeutralController {
         }
       }
 
-      for (const acc of pendingOpen) {
-        if (!stillWaiting.includes(acc)) pendingOpen.delete(acc);
+      for (const acc of pendingLeader) {
+        if (!stillWaiting.includes(acc)) pendingLeader.delete(acc);
       }
 
-      if (pendingOpen.size === 0) break;
+      if (pendingLeader.size === 0) break;
 
-      // Re-place unfilled at current best price
-      console.log(`  🔄 ${pendingOpen.size} limit(s) unfilled — re-placing at fresh price...`);
+      console.log(`  🔄 ${pendingLeader.size} leader limit(s) unfilled — re-placing...`);
       await Promise.all(stillWaiting.map(async (acc) => {
         try {
           await acc.service.cancelAllOrders(srcToken);
           await acc.service.placePositionOrder({
             instrument: srcToken,
-            executionSide: acc.side!,
+            executionSide: limitSide,
             executionType: 'limit',
             amountUsd: acc.orderAmount!,
             leverage: acc.leverage,
           });
         } catch (e: any) {
-          console.log(`  ⚠️ Re-place failed for ${shortAddr(acc.address)}: ${e.message}`);
+          console.log(`  ⚠️ Leader re-place failed for ${shortAddr(acc.address)}: ${e.message}`);
         }
       }));
     }
 
-    console.log(`  ✅ All ${accounts.length} positions OPENED via LIMIT (maker)`);
+    console.log(`  ✅ All leader limits FILLED`);
 
-    // Cancel any remnants
-    for (const acc of accounts) {
+    // Cancel remnants on leader side
+    await Promise.all(limitAccounts.map(async (acc) => {
       try { await acc.service.cancelAllOrders(srcToken); } catch { /* ok */ }
+    }));
+
+    // Read actual leader base units for exact delta matching
+    let totalLimitBaseUnits = 0;
+    for (const acc of limitAccounts) {
+      const units = await acc.service.getPositionBaseUnits(srcToken);
+      totalLimitBaseUnits += units;
+      console.log(`  📐 ${shortAddr(acc.address)} leader: ${parseFloat(units.toFixed(6))} ${srcToken}`);
     }
+    console.log(`  📐 Total LEADER: ${parseFloat(totalLimitBaseUnits.toFixed(6))} ${srcToken}`);
+
+    // Distribute lots proportionally among followers
+    const totalFollowerWeight = marketAccounts.reduce((s, a) => s + (a.orderAmount ?? 1), 0);
+    const followerBaseUnits = marketAccounts.map((a) => {
+      const weight = (a.orderAmount ?? 1) / totalFollowerWeight;
+      return totalLimitBaseUnits * weight;
+    });
+
+    // Follower places MARKET orders (parallel, exact lot matching)
+    console.log(`\n  🚀 ${marketSide.toUpperCase()} placing MARKET orders (delta-matched)...`);
+    await Promise.all(marketAccounts.map(async (acc, i) => {
+      try {
+        await acc.service.placePositionOrder({
+          instrument: srcToken,
+          executionSide: marketSide,
+          executionType: 'market',
+          amountUsd: acc.orderAmount!,
+          leverage: acc.leverage,
+          overrideBaseUnits: followerBaseUnits[i],
+        });
+        console.log(`  ✅ ${shortAddr(acc.address)} follower MARKET filled`);
+      } catch (e: any) {
+        console.log(`  ❌ MARKET order failed for ${shortAddr(acc.address)}: ${e.message}`);
+        acc.failures++;
+      }
+    }));
 
     // Step 6: Verify positions + log liquidation info
     console.log('\n  🔍 Verifying positions...');

@@ -257,13 +257,13 @@ export class DeltaNeutralController {
       const pendingCleanup = new Set(accounts);
 
       // Initial limit placement
-      for (const acc of accounts) {
+      await Promise.all(accounts.map(async (acc) => {
         try {
           await acc.service.closePositionByLimit(srcToken);
         } catch {
           // best effort
         }
-      }
+      }));
 
       // Retry until all closed
       while (pendingCleanup.size > 0) {
@@ -295,14 +295,14 @@ export class DeltaNeutralController {
         if (pendingCleanup.size === 0) break;
 
         // Re-place unfilled
-        for (const acc of stillOpen) {
+        await Promise.all(stillOpen.map(async (acc) => {
           try {
             await acc.service.cancelAllOrders(srcToken);
             await acc.service.closePositionByLimit(srcToken);
           } catch {
             // best effort
           }
-        }
+        }));
       }
 
       console.log('  ✅ Emergency cleanup complete (maker)');
@@ -520,7 +520,7 @@ export class DeltaNeutralController {
     console.log(`\n  📋 Placing LIMIT orders on all ${accounts.length} wallets...`);
     const pendingOpen = new Set(accounts);
 
-    for (const acc of accounts) {
+    await Promise.all(accounts.map(async (acc) => {
       try {
         await acc.service.placePositionOrder({
           instrument: srcToken,
@@ -532,9 +532,8 @@ export class DeltaNeutralController {
       } catch (e: any) {
         console.log(`  ❌ LIMIT open failed for ${shortAddr(acc.address)}: ${e.message}`);
         acc.failures++;
-        throw new Error('Limit open placement failed');
       }
-    }
+    }));
 
     // Retry loop: every 10s check + re-place unfilled at fresh price
     while (pendingOpen.size > 0) {
@@ -571,7 +570,7 @@ export class DeltaNeutralController {
 
       // Re-place unfilled at current best price
       console.log(`  🔄 ${pendingOpen.size} limit(s) unfilled — re-placing at fresh price...`);
-      for (const acc of stillWaiting) {
+      await Promise.all(stillWaiting.map(async (acc) => {
         try {
           await acc.service.cancelAllOrders(srcToken);
           await acc.service.placePositionOrder({
@@ -584,7 +583,7 @@ export class DeltaNeutralController {
         } catch (e: any) {
           console.log(`  ⚠️ Re-place failed for ${shortAddr(acc.address)}: ${e.message}`);
         }
-      }
+      }));
     }
 
     console.log(`  ✅ All ${accounts.length} positions OPENED via LIMIT (maker)`);
@@ -671,13 +670,13 @@ export class DeltaNeutralController {
     const pendingClose = new Set(accounts);
 
     // Initial placement
-    for (const acc of accounts) {
+    await Promise.all(accounts.map(async (acc) => {
       try {
         await acc.service.closePositionByLimit(srcToken);
       } catch (e: any) {
         console.log(`  ⚠️ Limit close failed for ${shortAddr(acc.address)}: ${e.message}`);
       }
-    }
+    }));
 
     // Retry loop: wait → check → re-place unfilled
     let closeRetryCount = 0;
@@ -718,14 +717,14 @@ export class DeltaNeutralController {
 
       // Re-place unfilled
       console.log(`  🔄 ${pendingClose.size} limit(s) unfilled — cancelling & re-placing...`);
-      for (const acc of stillOpen) {
+      await Promise.all(stillOpen.map(async (acc) => {
         try {
           await acc.service.cancelAllOrders(srcToken);
           await acc.service.closePositionByLimit(srcToken);
         } catch (e: any) {
           console.log(`  ⚠️ Re-place failed for ${shortAddr(acc.address)}: ${e.message}`);
         }
-      }
+      }));
     }
 
     console.log(`  ✅ All positions closed via LIMIT (maker) after ${closeRetryCount} attempt(s)`);

@@ -511,7 +511,6 @@ export class DeltaNeutralController {
   private async executeLeaderFollower(group: ActiveGroup, srcToken: string): Promise<void> {
     const { accounts, groupConfig, id } = group;
     const [longCount] = groupConfig;
-    const timeoutMs = LIMIT_FILL_TIMEOUT_MINUTES * 60 * 1000;
 
     // Determine limit side (side with biggest orderAmount)
     const biggest = [...accounts].sort((a, b) => (b.orderAmount ?? 0) - (a.orderAmount ?? 0))[0]!;
@@ -521,12 +520,15 @@ export class DeltaNeutralController {
     const limitAccounts = accounts.filter((a) => a.side === limitSide);
     const marketAccounts = accounts.filter((a) => a.side === marketSide);
 
-    console.log(`\n  🎯 LIMIT side: ${limitSide.toUpperCase()} (${limitAccounts.length}) | MARKET side: ${marketSide.toUpperCase()} (${marketAccounts.length})`);
+    console.log(`\n  🎯 LEADER: ${limitSide.toUpperCase()} (${limitAccounts.length}) | FOLLOWER: ${marketSide.toUpperCase()} (${marketAccounts.length})`);
+    console.log(`  📋 Both sides open via LIMIT (maker) with 1-min retry`);
 
     // ========== OPEN ==========
 
-    // Step 1: Limit side places LIMIT orders
+    // Step 1: Leader places LIMIT orders + retry until filled
     console.log(`\n  📋 ${limitSide.toUpperCase()} placing LIMIT orders...`);
+    const pendingLeader = new Set(limitAccounts);
+
     for (const acc of limitAccounts) {
       try {
         await acc.service.placePositionOrder({
@@ -543,14 +545,60 @@ export class DeltaNeutralController {
       }
     }
 
-    // Step 2: Wait for ALL limit fills
-    console.log(`\n  ⏳ Waiting for ${limitAccounts.length} limit fill(s) (timeout: ${LIMIT_FILL_TIMEOUT_MINUTES} min)...`);
-    await Promise.all(
-      limitAccounts.map((acc) => this.waitForPositionOpen(acc, srcToken, timeoutMs))
-    );
-    console.log(`  ✅ All limit orders FILLED`);
+    // Retry loop for leader
+    while (pendingLeader.size > 0) {
+      await sleep(60); // 1 minute
 
-    // Step 2.5: Cancel unfilled remnants on limit side
+      const stillWaiting: GroupAccount[] = [];
+      for (const acc of pendingLeader) {
+        try {
+          const state = await acc.service.getPositions();
+          const subaccounts = state.snapshot?.subaccounts ?? [];
+          let hasPosition = false;
+          for (const sub of subaccounts) {
+            const positions = sub.positions ?? [];
+            if (positions.some((p) => p.symbol === srcToken && Number(p.basePositionLots) !== 0)) {
+              hasPosition = true;
+              break;
+            }
+          }
+          if (hasPosition) {
+            console.log(`  ✅ ${shortAddr(acc.address)} leader limit FILLED`);
+          } else {
+            stillWaiting.push(acc);
+          }
+        } catch {
+          stillWaiting.push(acc);
+        }
+      }
+
+      for (const acc of pendingLeader) {
+        if (!stillWaiting.includes(acc)) pendingLeader.delete(acc);
+      }
+
+      if (pendingLeader.size === 0) break;
+
+      // Re-place unfilled leader limits
+      console.log(`  🔄 ${pendingLeader.size} leader limit(s) unfilled — re-placing...`);
+      for (const acc of stillWaiting) {
+        try {
+          await acc.service.cancelAllOrders(srcToken);
+          await acc.service.placePositionOrder({
+            instrument: srcToken,
+            executionSide: limitSide,
+            executionType: 'limit',
+            amountUsd: acc.orderAmount!,
+            leverage: acc.leverage,
+          });
+        } catch (e: any) {
+          console.log(`  ⚠️ Leader re-place failed for ${shortAddr(acc.address)}: ${e.message}`);
+        }
+      }
+    }
+
+    console.log(`  ✅ All leader limits FILLED`);
+
+    // Step 2: Cancel unfilled remnants on leader side
     for (const acc of limitAccounts) {
       try {
         await acc.service.cancelAllOrders(srcToken);
@@ -564,14 +612,14 @@ export class DeltaNeutralController {
       await sleepByRange(DELAY_AFTER_LEADER_FILL, 'Delay after leader fill');
     }
 
-    // Step 3.5: Read actual limit-side position sizes for exact delta matching
+    // Step 4: Read actual limit-side position sizes for exact delta matching
     let totalLimitBaseUnits = 0;
     for (const acc of limitAccounts) {
       const units = await acc.service.getPositionBaseUnits(srcToken);
       totalLimitBaseUnits += units;
-      console.log(`  📐 ${shortAddr(acc.address)} limit position: ${parseFloat(units.toFixed(6))} ${srcToken}`);
+      console.log(`  📐 ${shortAddr(acc.address)} leader position: ${parseFloat(units.toFixed(6))} ${srcToken}`);
     }
-    console.log(`  📐 Total LIMIT side: ${parseFloat(totalLimitBaseUnits.toFixed(6))} ${srcToken} — MARKET side must match`);
+    console.log(`  📐 Total LEADER: ${parseFloat(totalLimitBaseUnits.toFixed(6))} ${srcToken} — follower must match`);
 
     // Distribute lots proportionally among followers
     const totalFollowerWeight = marketAccounts.reduce((s, a) => s + (a.orderAmount ?? 1), 0);
@@ -580,32 +628,90 @@ export class DeltaNeutralController {
       return totalLimitBaseUnits * weight;
     });
 
-    // Step 4: Check spread before market orders
-    if (MAX_SPREAD > 0) {
-      const snap = await accounts[0]!.service.getMarketSnapshot(srcToken);
-      if (snap.spreadPercent > MAX_SPREAD) {
-        console.log(`  ⚠️ Spread widened: ${snap.spreadPercent.toFixed(4)}% — waiting...`);
-        await accounts[0]!.service.waitForSpread(srcToken, MAX_SPREAD, POLL_INTERVAL_SEC, 60);
-      }
-    }
+    // Step 5: Follower places LIMIT orders (NOT market!) + retry until filled
+    console.log(`\n  📋 ${marketSide.toUpperCase()} placing LIMIT orders (delta-matched)...`);
+    const pendingFollower = new Set(marketAccounts);
 
-    // Step 5: Market side places MARKET orders with exact lot matching
-    console.log(`\n  🚀 ${marketSide.toUpperCase()} placing MARKET orders (delta-matched)...`);
     for (let i = 0; i < marketAccounts.length; i++) {
       const acc = marketAccounts[i]!;
       try {
         await acc.service.placePositionOrder({
           instrument: srcToken,
           executionSide: marketSide,
-          executionType: 'market',
+          executionType: 'limit',
           amountUsd: acc.orderAmount!,
           leverage: acc.leverage,
           overrideBaseUnits: followerBaseUnits[i],
         });
       } catch (e: any) {
-        console.log(`  ❌ MARKET order failed for ${shortAddr(acc.address)}: ${e.message}`);
+        console.log(`  ❌ LIMIT order failed for ${shortAddr(acc.address)}: ${e.message}`);
         acc.failures++;
-        throw new Error('Market order placement failed');
+        throw new Error('Follower limit placement failed');
+      }
+    }
+
+    // Retry loop for follower
+    while (pendingFollower.size > 0) {
+      await sleep(60); // 1 minute
+
+      const stillWaiting: GroupAccount[] = [];
+      for (const acc of pendingFollower) {
+        try {
+          const state = await acc.service.getPositions();
+          const subaccounts = state.snapshot?.subaccounts ?? [];
+          let hasPosition = false;
+          for (const sub of subaccounts) {
+            const positions = sub.positions ?? [];
+            if (positions.some((p) => p.symbol === srcToken && Number(p.basePositionLots) !== 0)) {
+              hasPosition = true;
+              break;
+            }
+          }
+          if (hasPosition) {
+            console.log(`  ✅ ${shortAddr(acc.address)} follower limit FILLED`);
+          } else {
+            stillWaiting.push(acc);
+          }
+        } catch {
+          stillWaiting.push(acc);
+        }
+      }
+
+      for (const acc of pendingFollower) {
+        if (!stillWaiting.includes(acc)) pendingFollower.delete(acc);
+      }
+
+      if (pendingFollower.size === 0) break;
+
+      // Re-place unfilled follower limits
+      console.log(`  🔄 ${pendingFollower.size} follower limit(s) unfilled — re-placing...`);
+      for (let i = 0; i < marketAccounts.length; i++) {
+        const acc = marketAccounts[i]!;
+        if (!stillWaiting.includes(acc)) continue;
+        try {
+          await acc.service.cancelAllOrders(srcToken);
+          await acc.service.placePositionOrder({
+            instrument: srcToken,
+            executionSide: marketSide,
+            executionType: 'limit',
+            amountUsd: acc.orderAmount!,
+            leverage: acc.leverage,
+            overrideBaseUnits: followerBaseUnits[i],
+          });
+        } catch (e: any) {
+          console.log(`  ⚠️ Follower re-place failed for ${shortAddr(acc.address)}: ${e.message}`);
+        }
+      }
+    }
+
+    console.log(`  ✅ All follower limits FILLED`);
+
+    // Cancel remnants on follower side
+    for (const acc of marketAccounts) {
+      try {
+        await acc.service.cancelAllOrders(srcToken);
+      } catch {
+        // ok
       }
     }
 

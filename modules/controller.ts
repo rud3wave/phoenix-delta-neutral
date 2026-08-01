@@ -9,11 +9,10 @@
 
 import {
   GROUP_CONFIGS,
-  LEVERAGE_RANGE,
-  MARGIN_RANGE,
+  TOKEN_LEVERAGE,
+  POSITION_PERCENT,
   MAX_SPREAD,
-  LIMIT_FILL_TIMEOUT_MINUTES,
-  CLOSE_LIMIT_TIMEOUT_MINUTES,
+  CLOSE_RETRY_INTERVAL_SEC,
   DELAY_AFTER_LEADER_FILL,
   HOLD_MINUTES,
   TRADES_COUNT,
@@ -21,7 +20,6 @@ import {
   POLL_INTERVAL_SEC,
   TOKENS_TO_TRADE,
   RETRY,
-  MIN_LIQUIDATION_DISTANCE,
 } from '../settings.js';
 import { PhoenixService } from './phoenix-service.js';
 import { sendTg } from './telegram.js';
@@ -212,11 +210,11 @@ export class DeltaNeutralController {
       // Step 1: Wait for acceptable spread
       const maxSpread = MAX_SPREAD > 0 ? MAX_SPREAD : 0.05;
       const { midPrice } = await accounts[0]!.service.waitForSpread(
-        srcToken, maxSpread, POLL_INTERVAL_SEC, LIMIT_FILL_TIMEOUT_MINUTES * 60
+        srcToken, maxSpread, POLL_INTERVAL_SEC, 180
       );
 
       // Step 2: Calculate position allocation
-      this.calculateAllocation(accounts, longCount);
+      this.calculateAllocation(accounts, longCount, srcToken);
 
       const longAccounts = accounts.filter((a) => a.side === 'long');
       const shortAccounts = accounts.filter((a) => a.side === 'short');
@@ -252,7 +250,7 @@ export class DeltaNeutralController {
 
       // Retry until all closed
       while (pendingCleanup.size > 0) {
-        await sleep(10);
+        await sleep(CLOSE_RETRY_INTERVAL_SEC);
 
         const stillOpen: GroupAccount[] = [];
         for (const acc of pendingCleanup) {
@@ -329,23 +327,17 @@ export class DeltaNeutralController {
   /**
    * Try to compute a balanced allocation where LONG notional == SHORT notional exactly.
    *
-   * Formula: notional = balance × (margin% / 100) × leverage
-   * - margin% from MARGIN_RANGE controls risk (liquidation distance)
-   * - leverage from LEVERAGE_RANGE controls position multiplier
-   *
-   * Source side (fewer wallets, larger balances) gets random margin% + leverage.
-   * Target side (more wallets, smaller balances) is derived to match source total.
-   *
-   * Returns true on success, false if factorization failed (caller should retry).
+   * Formula: notional = balance × (percent / 100) × leverage
+   * - percent from POSITION_PERCENT controls risk (liquidation distance)
+   * - leverage from TOKEN_LEVERAGE[token] controls position multiplier
    */
-  private tryCalculateAllocation(accounts: GroupAccount[], longCount: number): boolean {
-    const [minLev, maxLev] = LEVERAGE_RANGE;
-    const [minMarginPct, maxMarginPct] = MARGIN_RANGE;
+  private tryCalculateAllocation(accounts: GroupAccount[], longCount: number, token: string): boolean {
+    const levRange = TOKEN_LEVERAGE[token as keyof typeof TOKEN_LEVERAGE] ?? TOKEN_LEVERAGE.ETH;
+    const [minLev, maxLev] = levRange;
+    const [minPct, maxPct] = POSITION_PERCENT;
 
-    // Sort by balance descending — larger balances first
     const sorted = [...accounts].sort((a, b) => b.balance - a.balance);
 
-    // The side with FEWER wallets = source (gets larger-balance accounts)
     const longIsSource = longCount <= accounts.length - longCount;
     const sourceCount = longIsSource ? longCount : accounts.length - longCount;
     const targetCount = accounts.length - sourceCount;
@@ -353,46 +345,39 @@ export class DeltaNeutralController {
     const sourceAccounts = sorted.slice(0, sourceCount);
     const targetAccounts = sorted.slice(sourceCount);
 
-    // --- Source side: notional = balance × (margin%/100) × leverage ---
+    // --- Source side: notional = balance × (percent/100) × leverage ---
     const sourceData: { account: GroupAccount; leverage: number; notional: number }[] = [];
     let targetNotional = 0;
 
     for (const acc of sourceAccounts) {
-      const leverage = getRandomNumber(LEVERAGE_RANGE);
-      const marginPct = getRandomNumber(MARGIN_RANGE);
-      const notional = acc.balance * (marginPct / 100) * leverage;
-
+      const leverage = getRandomNumber(levRange);
+      const pct = getRandomNumber(POSITION_PERCENT);
+      const notional = acc.balance * (pct / 100) * leverage;
       if (notional <= 0) return false;
-
       sourceData.push({ account: acc, leverage, notional });
       targetNotional += notional;
     }
 
     // --- Target side: derived to match ---
-    // Min notional = balance × (minMarginPct/100) × minLev
-    // Max notional = balance × (maxMarginPct/100) × maxLev
     const targetCaps = targetAccounts.map((acc) => ({
       account: acc,
-      minCap: acc.balance * (minMarginPct / 100) * minLev,
-      maxCap: acc.balance * (maxMarginPct / 100) * maxLev,
+      minCap: acc.balance * (minPct / 100) * minLev,
+      maxCap: acc.balance * (maxPct / 100) * maxLev,
     }));
 
     const totalMinCap = targetCaps.reduce((s, c) => s + c.minCap, 0);
     const totalMaxCap = targetCaps.reduce((s, c) => s + c.maxCap, 0);
     if (targetNotional < totalMinCap || targetNotional > totalMaxCap) return false;
 
-    // Distribute targetNotional proportionally to capacity
     const rawWeights = targetCaps.map((c) => c.maxCap);
     const totalWeight = rawWeights.reduce((s, w) => s + w, 0);
 
     let parts: number[] | null = this.distributeNotional(
-      targetNotional,
-      targetCount,
+      targetNotional, targetCount,
       Math.max(...targetCaps.map((c) => c.minCap)),
       Math.min(...targetCaps.map((c) => c.maxCap))
     );
 
-    // If uniform min/max doesn't work, try proportional distribution
     if (!parts) {
       parts = [];
       let allocated = 0;
@@ -403,59 +388,44 @@ export class DeltaNeutralController {
         allocated += clamped;
       }
       const last = targetNotional - allocated;
-      if (last < targetCaps[targetCount - 1]!.minCap || last > targetCaps[targetCount - 1]!.maxCap) {
-        return false;
-      }
+      if (last < targetCaps[targetCount - 1]!.minCap || last > targetCaps[targetCount - 1]!.maxCap) return false;
       parts.push(last);
     }
 
-    // For each target wallet: pick random margin%, derive leverage = part / (balance × margin%/100)
+    // Derive leverage for each target wallet
     const targetData: { account: GroupAccount; leverage: number; notional: number }[] = [];
 
     for (let i = 0; i < targetCount; i++) {
       const acc = targetAccounts[i]!;
       const part = parts[i]!;
 
-      // leverage = part / (balance × marginPct/100)
-      // For leverage ∈ [minLev, maxLev]:
-      //   marginPct/100 ∈ [part / (balance × maxLev), part / (balance × minLev)]
-      let marginLow = (part / (acc.balance * maxLev)) * 100;
-      let marginHigh = (part / (acc.balance * minLev)) * 100;
+      let pctLow = (part / (acc.balance * maxLev)) * 100;
+      let pctHigh = (part / (acc.balance * minLev)) * 100;
+      pctLow = Math.max(pctLow, minPct);
+      pctHigh = Math.min(pctHigh, maxPct);
+      if (pctLow > pctHigh || pctLow <= 0) return false;
 
-      // Clamp to MARGIN_RANGE
-      marginLow = Math.max(marginLow, minMarginPct);
-      marginHigh = Math.min(marginHigh, maxMarginPct);
-
-      if (marginLow > marginHigh || marginLow <= 0) return false;
-
-      const marginPct = marginLow + Math.random() * (marginHigh - marginLow);
-      const leverage = part / (acc.balance * (marginPct / 100));
+      const pct = pctLow + Math.random() * (pctHigh - pctLow);
+      const leverage = part / (acc.balance * (pct / 100));
       const roundedLev = Math.round(leverage * 10) / 10;
-
       if (roundedLev < minLev || roundedLev > maxLev) return false;
 
       targetData.push({ account: acc, leverage: roundedLev, notional: part });
     }
 
-    // --- Liquidation distance check ---
-    // liqDistance ≈ (1 - marginPct/100) / (marginPct/100 × leverage) × 100
-    // We approximate using effective leverage = notional / balance
-    if (MIN_LIQUIDATION_DISTANCE > 0) {
-      const allData = [...sourceData, ...targetData];
-      for (const d of allData) {
-        const effectiveLev = d.notional / d.account.balance;
-        const liqDistance = (1 / effectiveLev) * 100;
-        if (liqDistance < MIN_LIQUIDATION_DISTANCE) return false;
-      }
+    // --- Liquidation safety (hardcoded 10% min distance) ---
+    const MIN_LIQ_DISTANCE = 10;
+    for (const d of [...sourceData, ...targetData]) {
+      const effectiveLev = d.notional / d.account.balance;
+      if ((1 / effectiveLev) * 100 < MIN_LIQ_DISTANCE) return false;
     }
 
-    // --- Assign to accounts ---
+    // --- Assign ---
     for (const d of sourceData) {
       d.account.side = longIsSource ? 'long' : 'short';
       d.account.orderAmount = d.notional;
       d.account.leverage = d.leverage;
     }
-
     for (const d of targetData) {
       d.account.side = longIsSource ? 'short' : 'long';
       d.account.orderAmount = d.notional;
@@ -466,11 +436,11 @@ export class DeltaNeutralController {
   }
 
   /**
-   * Public allocation entry point — retries tryCalculateAllocation up to 1000 times.
+   * Public allocation entry point — retries up to 1000 times.
    */
-  private calculateAllocation(accounts: GroupAccount[], longCount: number): void {
+  private calculateAllocation(accounts: GroupAccount[], longCount: number, token: string): void {
     for (let attempt = 0; attempt < 1000; attempt++) {
-      if (this.tryCalculateAllocation(accounts, longCount)) {
+      if (this.tryCalculateAllocation(accounts, longCount, token)) {
         const longTotal = accounts.filter((a) => a.side === 'long').reduce((s, a) => s + (a.orderAmount ?? 0), 0);
         const shortTotal = accounts.filter((a) => a.side === 'short').reduce((s, a) => s + (a.orderAmount ?? 0), 0);
         console.log(`  📐 Allocation OK (attempt ${attempt + 1}) | LONG: $${longTotal.toFixed(2)} | SHORT: $${shortTotal.toFixed(2)} | Δ: $${Math.abs(longTotal - shortTotal).toFixed(4)}`);
@@ -519,7 +489,7 @@ export class DeltaNeutralController {
 
     // Retry loop for leader: every 10s check + re-place unfilled
     while (pendingLeader.size > 0) {
-      await sleep(10);
+      await sleep(CLOSE_RETRY_INTERVAL_SEC);
 
       const stillWaiting: GroupAccount[] = [];
       for (const acc of pendingLeader) {
@@ -699,8 +669,8 @@ export class DeltaNeutralController {
 
     while (pendingClose.size > 0) {
       closeRetryCount++;
-      console.log(`\n  ⏳ Waiting 10s for close fills (attempt ${closeRetryCount})...`);
-      await sleep(10);
+      console.log(`\n  ⏳ Waiting ${CLOSE_RETRY_INTERVAL_SEC}s for close fills (attempt ${closeRetryCount})...`);
+      await sleep(CLOSE_RETRY_INTERVAL_SEC);
 
       const stillOpen: GroupAccount[] = [];
       for (const acc of pendingClose) {

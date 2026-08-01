@@ -641,7 +641,10 @@ export class DeltaNeutralController {
 
     console.log(`\n  📋 Closing: ${limitCloseSide.toUpperCase()} (${limitCloseAccounts.length}) via LIMIT | ${marketCloseSide.toUpperCase()} (${marketCloseAccounts.length}) via MARKET`);
 
-    // Step 7: Majority closes via LIMIT
+    // Step 7: Limit side — place + retry until ALL filled (no market fallback)
+    const pendingLimitClose = new Set(limitCloseAccounts);
+
+    // Initial placement
     for (const acc of limitCloseAccounts) {
       try {
         await acc.service.closePositionByLimit(srcToken);
@@ -650,38 +653,60 @@ export class DeltaNeutralController {
       }
     }
 
-    // Step 8: Wait for limit closes WITH timeout → fallback to market
-    const closeTimeoutMs = CLOSE_LIMIT_TIMEOUT_MINUTES * 60 * 1000;
-    const limitCloseResults = await Promise.allSettled(
-      limitCloseAccounts.map((acc) => this.waitForPositionClose(acc, srcToken, closeTimeoutMs))
-    );
+    // Retry loop: wait → check → re-place unfilled
+    let retryCount = 0;
 
-    const unfilledAccounts: GroupAccount[] = [];
-    for (let i = 0; i < limitCloseAccounts.length; i++) {
-      const result = limitCloseResults[i]!;
-      const acc = limitCloseAccounts[i]!;
-      if (result.status === 'rejected') {
-        console.log(`  ⚠️ Limit close timeout for ${shortAddr(acc.address)} — falling back to MARKET`);
-        unfilledAccounts.push(acc);
+    while (pendingLimitClose.size > 0) {
+      retryCount++;
+      console.log(`\n  ⏳ Waiting ${CLOSE_LIMIT_TIMEOUT_MINUTES} min for limit fills (attempt ${retryCount})...`);
+      await sleep(CLOSE_LIMIT_TIMEOUT_MINUTES * 60);
+
+      // Check which accounts still have open positions
+      const stillOpen: GroupAccount[] = [];
+      for (const acc of pendingLimitClose) {
+        try {
+          const state = await acc.service.getPositions();
+          const subaccounts = state.snapshot?.subaccounts ?? [];
+          let hasPosition = false;
+          for (const sub of subaccounts) {
+            const positions = sub.positions ?? [];
+            if (positions.some((p) => p.symbol === srcToken && Number(p.basePositionLots) !== 0)) {
+              hasPosition = true;
+              break;
+            }
+          }
+          if (hasPosition) {
+            stillOpen.push(acc);
+          } else {
+            console.log(`  ✅ ${shortAddr(acc.address)} closed via LIMIT (maker)`);
+          }
+        } catch {
+          stillOpen.push(acc); // assume still open on error
+        }
+      }
+
+      // Remove filled from pending
+      for (const acc of pendingLimitClose) {
+        if (!stillOpen.includes(acc)) {
+          pendingLimitClose.delete(acc);
+        }
+      }
+
+      if (pendingLimitClose.size === 0) break;
+
+      // Re-place limits for unfilled accounts
+      console.log(`  🔄 ${pendingLimitClose.size} limit(s) unfilled — cancelling & re-placing...`);
+      for (const acc of stillOpen) {
+        try {
+          await acc.service.cancelAllOrders(srcToken);
+          await acc.service.closePositionByLimit(srcToken);
+        } catch (e: any) {
+          console.log(`  ⚠️ Re-place failed for ${shortAddr(acc.address)}: ${e.message}`);
+        }
       }
     }
 
-    // Cancel unfilled limit orders and close via market
-    for (const acc of unfilledAccounts) {
-      try {
-        await acc.service.cancelAllOrders(srcToken);
-        await acc.service.closeAllPositionsAndOrders();
-        console.log(`  ✅ ${shortAddr(acc.address)} closed via MARKET (fallback)`);
-      } catch (e: any) {
-        console.log(`  ❌ Market fallback failed for ${shortAddr(acc.address)}: ${e.message}`);
-      }
-    }
-
-    if (unfilledAccounts.length === 0) {
-      console.log(`  ✅ ${limitCloseSide.toUpperCase()} group closed (maker fee)`);
-    } else {
-      console.log(`  ✅ ${limitCloseSide.toUpperCase()} group closed (${limitCloseAccounts.length - unfilledAccounts.length} maker + ${unfilledAccounts.length} taker fallback)`);
-    }
+    console.log(`  ✅ ${limitCloseSide.toUpperCase()} group closed via LIMIT (maker) after ${retryCount} attempt(s)`);
 
     // Step 9: Delay before market close
     if (!isRangeEmpty(DELAY_AFTER_LEADER_FILL)) {

@@ -37,8 +37,8 @@ export const MARGIN_RANGE: [number, number] = [50, 60];
 // [мин, макс] — рандомное значение из диапазона
 // МАКСИМАЛЬНЫЕ ПЛЕЧИ НА PHOENIX:
 //   SOL → 25x
-//   ETH → 50x
-//   BTC → 50x
+//   ETH → 25x
+//   BTC → 40x
 // Не ставь макс выше лимита токена — ордер отклонится.
 export const LEVERAGE_RANGE: [number, number] = [7, 15];
 

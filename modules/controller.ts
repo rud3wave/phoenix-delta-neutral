@@ -267,7 +267,7 @@ export class DeltaNeutralController {
 
       // Retry until all closed
       while (pendingCleanup.size > 0) {
-        await sleep(CLOSE_LIMIT_TIMEOUT_MINUTES * 60);
+        await sleep(20);
 
         const stillOpen: GroupAccount[] = [];
         for (const acc of pendingCleanup) {
@@ -538,7 +538,7 @@ export class DeltaNeutralController {
 
     // Retry loop: every 60s check + re-place unfilled at fresh price
     while (pendingOpen.size > 0) {
-      await sleep(60);
+      await sleep(20);
 
       const stillWaiting: GroupAccount[] = [];
       for (const acc of pendingOpen) {
@@ -684,8 +684,8 @@ export class DeltaNeutralController {
 
     while (pendingClose.size > 0) {
       closeRetryCount++;
-      console.log(`\n  ⏳ Waiting ${CLOSE_LIMIT_TIMEOUT_MINUTES} min for close fills (attempt ${closeRetryCount})...`);
-      await sleep(CLOSE_LIMIT_TIMEOUT_MINUTES * 60);
+      console.log(`\n  ⏳ Waiting 20s for close fills (attempt ${closeRetryCount})...`);
+      await sleep(20);
 
       const stillOpen: GroupAccount[] = [];
       for (const acc of pendingClose) {

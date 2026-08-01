@@ -12,7 +12,6 @@ import {
   TOKEN_LEVERAGE,
   POSITION_PERCENT,
   MAX_SPREAD,
-  CLOSE_RETRY_INTERVAL_SEC,
   DELAY_AFTER_LEADER_FILL,
   HOLD_MINUTES,
   TRADES_COUNT,
@@ -250,7 +249,7 @@ export class DeltaNeutralController {
 
       // Retry until all closed
       while (pendingCleanup.size > 0) {
-        await sleep(CLOSE_RETRY_INTERVAL_SEC);
+        await sleep(10);
 
         const stillOpen: GroupAccount[] = [];
         for (const acc of pendingCleanup) {
@@ -489,7 +488,7 @@ export class DeltaNeutralController {
 
     // Retry loop for leader: every 10s check + re-place unfilled
     while (pendingLeader.size > 0) {
-      await sleep(CLOSE_RETRY_INTERVAL_SEC);
+      await sleep(10);
 
       const stillWaiting: GroupAccount[] = [];
       for (const acc of pendingLeader) {
@@ -669,8 +668,8 @@ export class DeltaNeutralController {
 
     while (pendingClose.size > 0) {
       closeRetryCount++;
-      console.log(`\n  ⏳ Waiting ${CLOSE_RETRY_INTERVAL_SEC}s for close fills (attempt ${closeRetryCount})...`);
-      await sleep(CLOSE_RETRY_INTERVAL_SEC);
+      console.log(`\n  ⏳ Waiting 10s for close fills (attempt ${closeRetryCount})...`);
+      await sleep(10);
 
       const stillOpen: GroupAccount[] = [];
       for (const acc of pendingClose) {

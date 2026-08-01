@@ -8,26 +8,26 @@ export function sleep(seconds: number): Promise<void> {
 }
 
 /** Sleep for a random duration from [min, max] range (seconds) */
-export async function sleepByRange(range: [number, number], label?: string): Promise<void> {
+export async function sleepByRange(range: readonly [number, number], label?: string): Promise<void> {
   const seconds = getRandomNumber(range);
   if (label) console.log(`  ⏳ ${label}: ${seconds.toFixed(1)}s`);
   await sleep(seconds);
 }
 
 /** Random number from [min, max] range. If round=true, returns integer */
-export function getRandomNumber(range: [number, number], round = false): number {
+export function getRandomNumber(range: readonly [number, number], round = false): number {
   const [min, max] = range;
   const value = min + Math.random() * (max - min);
   return round ? Math.round(value) : value;
 }
 
 /** Alias for getRandomNumber */
-export function getRandomNumberRange(range: [number, number]): number {
+export function getRandomNumberRange(range: readonly [number, number]): number {
   return getRandomNumber(range);
 }
 
 /** Check if range is effectively empty (both values are 0) */
-export function isRangeEmpty(range: [number, number]): boolean {
+export function isRangeEmpty(range: readonly [number, number]): boolean {
   return range[0] === 0 && range[1] === 0;
 }
 

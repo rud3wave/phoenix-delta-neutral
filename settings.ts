@@ -22,20 +22,20 @@ export const TOKENS_TO_TRADE = ['ETH'];
 // Какой % баланса задействовать под позицию [мин, макс]
 // Меньше % = безопаснее (дальше ликвидация), но меньше объём
 // Больше % = агрессивнее (ближе ликвидация), но больше объём
-export const MARGIN_RANGE = [50, 60] as const;
+export const MARGIN_RANGE = [50, 60];
 
 // Плечо — множитель позиции от ЗАДЕЙСТВОВАННОЙ маржи (не от всего баланса)
 // МАКСИМАЛЬНЫЕ ПЛЕЧИ НА PHOENIX:
 //   SOL → 25x
 //   ETH → 25x
 //   BTC → 40x
-export const LEVERAGE_RANGE = [7, 15] as const;
+export const LEVERAGE_RANGE = [7, 15];
 
 // Конфигурация групп [longCount, shortCount]
 // ДОЛЖНО совпадать с количеством кошельков!
 // 3 кошелька → [2, 1] или [1, 2]
 // 5 кошельков → [3, 2] или [2, 3]
-export const GROUP_CONFIGS = [[3, 2]] as const;
+export const GROUP_CONFIGS = [[3, 2]];
 
 // --- НАСТРОЙКИ ОРДЕРОВ ---
 
@@ -52,16 +52,16 @@ export const LEADER_ORDER_TYPE = 'limit';
 export const LIMIT_FILL_TIMEOUT_MINUTES = 3;
 
 // Задержка после заполнения лимитки лидера (секунды)
-export const DELAY_AFTER_LEADER_FILL = [0, 1] as const;
+export const DELAY_AFTER_LEADER_FILL = [0, 1];
 
 // --- НАСТРОЙКИ УДЕРЖАНИЯ ---
 
 // Время удержания позиций перед закрытием (минуты) [мин, макс]
 // [0, 0] = держать бесконечно (закрытие вручную через close-positions)
-export const HOLD_MINUTES = [10000, 12000] as const;
+export const HOLD_MINUTES = [10000, 12000];
 
 // Количество торговых циклов (открытие → закрытие = 1 цикл)
-export const TRADES_COUNT = [2, 5] as const;
+export const TRADES_COUNT = [2, 5];
 
 // --- НАСТРОЙКИ ЗАКРЫТИЯ ---
 
@@ -77,10 +77,10 @@ export const CLOSE_LIMIT_TIMEOUT_MINUTES = 3;
 // --- ЗАДЕРЖКИ (секунды) [мин, макс] ---
 
 // Задержка между циклами
-export const DELAY_BETWEEN_TRADES = [10, 30] as const;
+export const DELAY_BETWEEN_TRADES = [10, 30];
 
 // Задержка между кошельками при старте
-export const DELAY_BETWEEN_WALLETS = [3, 8] as const;
+export const DELAY_BETWEEN_WALLETS = [3, 8];
 
 // Интервал опроса позиций (секунды) — как часто бот проверяет статус на бирже
 export const POLL_INTERVAL_SEC = 5;

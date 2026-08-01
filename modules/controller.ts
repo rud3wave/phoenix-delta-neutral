@@ -54,7 +54,7 @@ interface ActiveGroup {
   id: string;
   accounts: GroupAccount[];
   srcToken: string;
-  groupConfig: readonly [number, number];
+  groupConfig: readonly number[];
 }
 
 // ==================== CONTROLLER ====================

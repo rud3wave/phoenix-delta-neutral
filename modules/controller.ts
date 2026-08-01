@@ -21,6 +21,7 @@ import {
   POLL_INTERVAL_SEC,
   TOKENS_TO_TRADE,
   RETRY,
+  MIN_LIQUIDATION_DISTANCE,
 } from '../settings.js';
 import { PhoenixService } from './phoenix-service.js';
 import { sendTg } from './telegram.js';
@@ -132,10 +133,23 @@ export class DeltaNeutralController {
           continue;
         }
 
-        // Shuffle and pick group
-        const shuffled = shuffleArray(this.pool);
-        const selected = shuffled.slice(0, groupSize);
-        const remaining = shuffled.slice(groupSize);
+        // Smart group formation: sort by balance, give larger wallets to smaller side
+        const sortedPool = [...this.pool].sort((a, b) => b.balance - a.balance);
+        const smallerSideCount = Math.min(sideACount, sideBCount);
+        const largerSideCount = Math.max(sideACount, sideBCount);
+
+        // Top balances → smaller side (they carry more notional per wallet)
+        const smallerSideAccounts = sortedPool.slice(0, smallerSideCount);
+        // Remaining → shuffle and pick for larger side
+        const restPool = sortedPool.slice(smallerSideCount);
+        const shuffledRest = shuffleArray(restPool);
+        const largerSideAccounts = shuffledRest.slice(0, largerSideCount);
+        const remaining = shuffledRest.slice(largerSideCount);
+
+        // Randomly decide which side is LONG
+        const selected = Math.random() < 0.5
+          ? [...smallerSideAccounts, ...largerSideAccounts]
+          : [...largerSideAccounts, ...smallerSideAccounts];
 
         // Refresh balances
         console.log('\n  🔄 Refreshing balances...');
@@ -251,37 +265,195 @@ export class DeltaNeutralController {
 
   // ==================== ALLOCATION ====================
 
-  private calculateAllocation(accounts: GroupAccount[], longCount: number): void {
+  /**
+   * Distribute `total` into `n` parts where each part ∈ [min, max] and sum == total.
+   * Uses random constrained partitioning.
+   */
+  private distributeNotional(total: number, n: number, min: number, max: number): number[] | null {
+    if (n === 1) return total >= min && total <= max ? [total] : null;
+    if (total < n * min || total > n * max) return null;
+
+    const parts: number[] = new Array(n).fill(min);
+    let remaining = total - n * min;
+
+    for (let i = 0; i < n - 1 && remaining > 0; i++) {
+      const maxAdd = Math.min(max - min, remaining);
+      const add = Math.random() * maxAdd;
+      parts[i] += add;
+      remaining -= add;
+    }
+    parts[n - 1] += remaining;
+
+    // Fix floating-point drift
+    const drift = total - parts.reduce((s, p) => s + p, 0);
+    parts[n - 1] += drift;
+
+    return parts;
+  }
+
+  /**
+   * Try to compute a balanced allocation where LONG notional == SHORT notional exactly.
+   *
+   * Source side (fewer wallets, larger balances) gets random margin + leverage.
+   * Target side (more wallets, smaller balances) is derived to match source total.
+   *
+   * Returns true on success, false if factorization failed (caller should retry).
+   */
+  private tryCalculateAllocation(accounts: GroupAccount[], longCount: number): boolean {
+    const [minLev, maxLev] = LEVERAGE_RANGE;
+    const [minMarginParam, maxMarginParam] = MARGIN_RANGE;
+
+    // Sort by balance descending — larger balances first
     const sorted = [...accounts].sort((a, b) => b.balance - a.balance);
 
-    const accountData = sorted.map((account) => {
+    // The side with FEWER wallets = source (gets larger-balance accounts)
+    const longIsSource = longCount <= accounts.length - longCount;
+    const sourceCount = longIsSource ? longCount : accounts.length - longCount;
+    const targetCount = accounts.length - sourceCount;
+
+    const sourceAccounts = sorted.slice(0, sourceCount);
+    const targetAccounts = sorted.slice(sourceCount);
+
+    // --- Source side: fully random ---
+    const sourceData: { account: GroupAccount; margin: number; leverage: number; notional: number }[] = [];
+    let targetNotional = 0;
+
+    for (const acc of sourceAccounts) {
       const leverage = getRandomNumber(LEVERAGE_RANGE);
-      const safeBalance = account.balance * 0.99;
-      const margin = Math.min(resolveMargin(account.balance, getRandomNumber(MARGIN_RANGE)), safeBalance);
+      const safeBalance = acc.balance * 0.99;
+      const margin = Math.min(resolveMargin(acc.balance, getRandomNumber(MARGIN_RANGE)), safeBalance);
       const notional = margin * leverage;
-      return { account, leverage, margin, notional };
+
+      if (margin <= 0 || notional <= 0) return false;
+
+      sourceData.push({ account: acc, margin, leverage, notional });
+      targetNotional += notional;
+    }
+
+    // --- Target side: derived to match ---
+
+    // Compute per-wallet notional capacity on target side
+    const targetCaps = targetAccounts.map((acc) => {
+      const safeBalance = acc.balance * 0.99;
+      const maxMargin = MARGIN_MODE === 'percent'
+        ? safeBalance * (Math.min(maxMarginParam, 100) / 100)
+        : Math.min(maxMarginParam, safeBalance);
+      return { account: acc, minCap: 0.01, maxCap: maxMargin * maxLev };
     });
 
-    const longData = accountData.slice(0, longCount);
-    const shortData = accountData.slice(longCount);
+    const totalMinCap = targetCaps.reduce((s, c) => s + c.minCap, 0);
+    const totalMaxCap = targetCaps.reduce((s, c) => s + c.maxCap, 0);
+    if (targetNotional < totalMinCap || targetNotional > totalMaxCap) return false;
 
-    const totalLongNotional = longData.reduce((s, a) => s + a.notional, 0);
-    const totalShortNotional = shortData.reduce((s, a) => s + a.notional, 0);
-    const targetPerSide = Math.min(totalLongNotional, totalShortNotional);
+    // Distribute targetNotional proportionally, clamped to caps
+    const rawWeights = targetCaps.map((c) => c.maxCap);
+    const totalWeight = rawWeights.reduce((s, w) => s + w, 0);
+    const notionalParts = this.distributeNotional(
+      targetNotional,
+      targetCount,
+      Math.max(...targetCaps.map((c) => c.minCap)),
+      Math.min(...targetCaps.map((c) => c.maxCap))
+    );
 
-    for (const d of longData) {
-      const proportion = totalLongNotional > 0 ? d.notional / totalLongNotional : 1 / longData.length;
-      d.account.side = 'long';
-      d.account.orderAmount = targetPerSide * proportion;
+    // If uniform min/max doesn't work, try proportional distribution
+    let parts: number[] | null = notionalParts;
+    if (!parts) {
+      parts = [];
+      let allocated = 0;
+      for (let i = 0; i < targetCount - 1; i++) {
+        const proportional = (rawWeights[i] / totalWeight) * targetNotional;
+        const clamped = Math.max(targetCaps[i]!.minCap, Math.min(targetCaps[i]!.maxCap, proportional));
+        parts.push(clamped);
+        allocated += clamped;
+      }
+      const last = targetNotional - allocated;
+      if (last < targetCaps[targetCount - 1]!.minCap || last > targetCaps[targetCount - 1]!.maxCap) {
+        return false;
+      }
+      parts.push(last);
+    }
+
+    // For each target wallet: find margin + leverage such that margin * leverage == part
+    const targetData: { account: GroupAccount; margin: number; leverage: number; notional: number }[] = [];
+
+    for (let i = 0; i < targetCount; i++) {
+      const acc = targetAccounts[i]!;
+      const part = parts[i]!;
+      const safeBalance = acc.balance * 0.99;
+
+      // Compute valid margin range so leverage stays in [minLev, maxLev]
+      // leverage = part / margin → margin = part / leverage
+      // For leverage ∈ [minLev, maxLev]: margin ∈ [part/maxLev, part/minLev]
+      let marginLow = part / maxLev;
+      let marginHigh = part / minLev;
+
+      // Clamp to balance constraints
+      if (MARGIN_MODE === 'percent') {
+        const absMinMargin = safeBalance * (Math.max(minMarginParam, 0) / 100);
+        const absMaxMargin = safeBalance * (Math.min(maxMarginParam, 100) / 100);
+        marginLow = Math.max(marginLow, absMinMargin);
+        marginHigh = Math.min(marginHigh, absMaxMargin);
+      } else {
+        marginLow = Math.max(marginLow, minMarginParam);
+        marginHigh = Math.min(marginHigh, maxMarginParam, safeBalance);
+      }
+
+      if (marginLow > marginHigh || marginLow <= 0) return false;
+
+      const margin = marginLow + Math.random() * (marginHigh - marginLow);
+      const leverage = part / margin;
+
+      // Round leverage to 1 decimal (Phoenix accepts float leverage)
+      const roundedLev = Math.round(leverage * 10) / 10;
+      if (roundedLev < minLev || roundedLev > maxLev) return false;
+
+      targetData.push({ account: acc, margin, leverage: roundedLev, notional: part });
+    }
+
+    // --- Liquidation distance check ---
+    if (MIN_LIQUIDATION_DISTANCE > 0) {
+      const allData = [...sourceData, ...targetData];
+      for (const d of allData) {
+        // Approximate liq distance: with cross margin, rough formula:
+        // liqDistance% ≈ (1 / effectiveLev) * 100 - maintenanceMargin%
+        // effectiveLev = notional / balance (since cross margin uses full balance)
+        const effectiveLev = d.notional / d.account.balance;
+        // Maintenance margin ~1% for most perps; liq when loss = balance
+        // loss% = 1/effectiveLev → liqDistance ≈ (1/effectiveLev)*100
+        const liqDistance = (1 / effectiveLev) * 100;
+        if (liqDistance < MIN_LIQUIDATION_DISTANCE) return false;
+      }
+    }
+
+    // --- Assign to accounts ---
+    for (const d of sourceData) {
+      d.account.side = longIsSource ? 'long' : 'short';
+      d.account.orderAmount = d.notional;
       d.account.leverage = d.leverage;
     }
 
-    for (const d of shortData) {
-      const proportion = totalShortNotional > 0 ? d.notional / totalShortNotional : 1 / shortData.length;
-      d.account.side = 'short';
-      d.account.orderAmount = targetPerSide * proportion;
+    for (const d of targetData) {
+      d.account.side = longIsSource ? 'short' : 'long';
+      d.account.orderAmount = d.notional;
       d.account.leverage = d.leverage;
     }
+
+    return true;
+  }
+
+  /**
+   * Public allocation entry point — retries tryCalculateAllocation up to 1000 times.
+   */
+  private calculateAllocation(accounts: GroupAccount[], longCount: number): void {
+    for (let attempt = 0; attempt < 1000; attempt++) {
+      if (this.tryCalculateAllocation(accounts, longCount)) {
+        const longTotal = accounts.filter((a) => a.side === 'long').reduce((s, a) => s + (a.orderAmount ?? 0), 0);
+        const shortTotal = accounts.filter((a) => a.side === 'short').reduce((s, a) => s + (a.orderAmount ?? 0), 0);
+        console.log(`  📐 Allocation OK (attempt ${attempt + 1}) | LONG: $${longTotal.toFixed(2)} | SHORT: $${shortTotal.toFixed(2)} | Δ: $${Math.abs(longTotal - shortTotal).toFixed(4)}`);
+        return;
+      }
+    }
+    throw new Error('Failed to calculate delta-neutral allocation after 1000 attempts');
   }
 
   // ==================== LEADER-FOLLOWER ====================

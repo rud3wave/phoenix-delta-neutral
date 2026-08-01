@@ -294,7 +294,6 @@ export class PhoenixService {
           this.traderPda = response.trader_pda;
 
           if (response.status === 'already_activated') {
-            console.log(`  ✅ [${tag}] Already onboarded (referral ${code})`);
             return true;
           }
 
@@ -337,7 +336,6 @@ export class PhoenixService {
     this.traderPda = registerResponse.traderPda;
 
     if (!registerResponse.includeRegisterTrader || registerResponse.instructions.length === 0) {
-      console.log(`  ✅ [${tag}] Trader already registered on-chain`);
       return;
     }
 

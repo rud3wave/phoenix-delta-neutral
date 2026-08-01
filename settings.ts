@@ -11,7 +11,7 @@ export const SHUFFLE_WALLETS = true;
 export const RETRY = 3;
 
 // --- ТОКЕНЫ ---
-// Single token → ['ETH']              — все группы торгуют только ETH
+// Single token → ['ETH'] — все группы торгуют только ETH
 // Multi token  → ['ETH', 'SOL', 'BTC'] — каждая группа рандомно выберет один
 export const TOKENS_TO_TRADE = ['ETH', 'SOL', 'BTC'];
 
@@ -20,7 +20,7 @@ export const TOKENS_TO_TRADE = ['ETH', 'SOL', 'BTC'];
 // 30-40% = консервативно (ликвидация далеко, меньше объём)
 // 50-60% = средне
 // 70-80% = агрессивно (ликвидация ближе, больше объём)
-export const POSITION_PERCENT = [40, 50];
+export const POSITION_PERCENT = [60, 70];
 
 // --- ПЛЕЧО ПО ТОКЕНАМ ---
 // У каждого токена свой максимум на бирже — не ставь выше!

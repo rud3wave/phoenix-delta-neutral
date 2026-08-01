@@ -16,8 +16,9 @@ export const SHUFFLE_WALLETS = true;
 export const RETRY = 3;
 
 // --- ТОКЕНЫ ДЛЯ ТОРГОВЛИ ---
-// Какие токены торговать на Phoenix
-export const TOKENS_TO_TRADE = ['ETH'];
+// Какие токены торговать на Phoenix (можно несколько, выберет рандомно)
+// Доступные: SOL, ETH, BTC
+export const TOKENS_TO_TRADE = ['ETH', 'SOL', 'BTC'];
 
 // --- НАСТРОЙКИ ПОЗИЦИЙ ---
 
@@ -32,16 +33,20 @@ export const MARGIN_MODE = 'percent'; // или 'usdc'
 export const MARGIN_RANGE: [number, number] = [50, 60];
 // export const MARGIN_RANGE: [number, number] = [250, 350]; // для usdc
 
-// Плечо (множитель)
+// Плечо (множитель) — effective leverage на сайте = balance × lev / balance = lev
 // [мин, макс] — рандомное значение из диапазона
-// Position Value = маржа × плечо
+// МАКСИМАЛЬНЫЕ ПЛЕЧИ НА PHOENIX:
+//   SOL → 25x
+//   ETH → 50x
+//   BTC → 50x
+// Не ставь макс выше лимита токена — ордер отклонится.
 export const LEVERAGE_RANGE: [number, number] = [7, 15];
 
 // Конфигурация групп [longCount, shortCount]
 // ДОЛЖНО совпадать с количеством кошельков!
 // 3 кошелька → [2, 1] или [1, 2]
 // 5 кошельков → [3, 2] или [2, 3]
-export const GROUP_CONFIGS: [number, number][] = [[1, 1]];
+export const GROUP_CONFIGS: [number, number][] = [[3, 2]];
 
 // --- НАСТРОЙКИ ОРДЕРОВ ---
 

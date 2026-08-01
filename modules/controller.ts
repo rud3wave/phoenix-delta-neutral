@@ -10,6 +10,7 @@
 import {
   GROUP_CONFIGS,
   LEVERAGE_RANGE,
+  MARGIN_RANGE,
   MAX_SPREAD,
   LIMIT_FILL_TIMEOUT_MINUTES,
   CLOSE_LIMIT_TIMEOUT_MINUTES,
@@ -328,16 +329,18 @@ export class DeltaNeutralController {
   /**
    * Try to compute a balanced allocation where LONG notional == SHORT notional exactly.
    *
-   * Formula: notional = balance × leverage (cross margin — full balance = collateral).
-   * Effective leverage on website = notional / balance = leverage. Matches settings.
+   * Formula: notional = balance × (margin% / 100) × leverage
+   * - margin% from MARGIN_RANGE controls risk (liquidation distance)
+   * - leverage from LEVERAGE_RANGE controls position multiplier
    *
-   * Source side (fewer wallets, larger balances) gets random leverage from LEVERAGE_RANGE.
+   * Source side (fewer wallets, larger balances) gets random margin% + leverage.
    * Target side (more wallets, smaller balances) is derived to match source total.
    *
    * Returns true on success, false if factorization failed (caller should retry).
    */
   private tryCalculateAllocation(accounts: GroupAccount[], longCount: number): boolean {
     const [minLev, maxLev] = LEVERAGE_RANGE;
+    const [minMarginPct, maxMarginPct] = MARGIN_RANGE;
 
     // Sort by balance descending — larger balances first
     const sorted = [...accounts].sort((a, b) => b.balance - a.balance);
@@ -350,13 +353,14 @@ export class DeltaNeutralController {
     const sourceAccounts = sorted.slice(0, sourceCount);
     const targetAccounts = sorted.slice(sourceCount);
 
-    // --- Source side: notional = balance × random_leverage ---
+    // --- Source side: notional = balance × (margin%/100) × leverage ---
     const sourceData: { account: GroupAccount; leverage: number; notional: number }[] = [];
     let targetNotional = 0;
 
     for (const acc of sourceAccounts) {
       const leverage = getRandomNumber(LEVERAGE_RANGE);
-      const notional = acc.balance * leverage;
+      const marginPct = getRandomNumber(MARGIN_RANGE);
+      const notional = acc.balance * (marginPct / 100) * leverage;
 
       if (notional <= 0) return false;
 
@@ -365,11 +369,12 @@ export class DeltaNeutralController {
     }
 
     // --- Target side: derived to match ---
-    // Each target wallet's capacity = balance × maxLev (max notional it can carry)
+    // Min notional = balance × (minMarginPct/100) × minLev
+    // Max notional = balance × (maxMarginPct/100) × maxLev
     const targetCaps = targetAccounts.map((acc) => ({
       account: acc,
-      minCap: acc.balance * minLev,
-      maxCap: acc.balance * maxLev,
+      minCap: acc.balance * (minMarginPct / 100) * minLev,
+      maxCap: acc.balance * (maxMarginPct / 100) * maxLev,
     }));
 
     const totalMinCap = targetCaps.reduce((s, c) => s + c.minCap, 0);
@@ -404,15 +409,27 @@ export class DeltaNeutralController {
       parts.push(last);
     }
 
-    // For each target wallet: leverage = notional_part / balance
+    // For each target wallet: pick random margin%, derive leverage = part / (balance × margin%/100)
     const targetData: { account: GroupAccount; leverage: number; notional: number }[] = [];
 
     for (let i = 0; i < targetCount; i++) {
       const acc = targetAccounts[i]!;
       const part = parts[i]!;
 
-      // Effective leverage = notional / balance
-      const leverage = part / acc.balance;
+      // leverage = part / (balance × marginPct/100)
+      // For leverage ∈ [minLev, maxLev]:
+      //   marginPct/100 ∈ [part / (balance × maxLev), part / (balance × minLev)]
+      let marginLow = (part / (acc.balance * maxLev)) * 100;
+      let marginHigh = (part / (acc.balance * minLev)) * 100;
+
+      // Clamp to MARGIN_RANGE
+      marginLow = Math.max(marginLow, minMarginPct);
+      marginHigh = Math.min(marginHigh, maxMarginPct);
+
+      if (marginLow > marginHigh || marginLow <= 0) return false;
+
+      const marginPct = marginLow + Math.random() * (marginHigh - marginLow);
+      const leverage = part / (acc.balance * (marginPct / 100));
       const roundedLev = Math.round(leverage * 10) / 10;
 
       if (roundedLev < minLev || roundedLev > maxLev) return false;
@@ -421,10 +438,13 @@ export class DeltaNeutralController {
     }
 
     // --- Liquidation distance check ---
+    // liqDistance ≈ (1 - marginPct/100) / (marginPct/100 × leverage) × 100
+    // We approximate using effective leverage = notional / balance
     if (MIN_LIQUIDATION_DISTANCE > 0) {
       const allData = [...sourceData, ...targetData];
       for (const d of allData) {
-        const liqDistance = (1 / d.leverage) * 100;
+        const effectiveLev = d.notional / d.account.balance;
+        const liqDistance = (1 / effectiveLev) * 100;
         if (liqDistance < MIN_LIQUIDATION_DISTANCE) return false;
       }
     }

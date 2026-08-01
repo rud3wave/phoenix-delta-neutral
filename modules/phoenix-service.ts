@@ -47,7 +47,6 @@ import {
   type SolanaInstruction,
   type TraderStateResponse,
 } from './phoenix-api.js';
-import { CLOSE_MAKER_OFFSET_BPS } from '../settings.js';
 
 // ==================== CONFIG ====================
 
@@ -154,7 +153,6 @@ export interface PlacePositionOrderParams {
   overrideBaseUnits?: number;
   takeProfitPricePercent?: number;
   stopLossPricePercent?: number;
-  useMidPrice?: boolean;
 }
 
 // ==================== SERVICE ====================
@@ -671,7 +669,6 @@ export class PhoenixService {
       executionType: 'limit',
       amountUsd: 0,
       overrideBaseUnits: baseUnits,
-      useMidPrice: true,
     });
   }
 
@@ -782,7 +779,7 @@ export class PhoenixService {
   // ==================== TRADING (Rise SDK) ====================
 
   public async placePositionOrder(params: PlacePositionOrderParams): Promise<{ rfqId: string }> {
-    const { instrument, executionSide, executionType, amountUsd, overrideBaseUnits, useMidPrice } = params;
+    const { instrument, executionSide, executionType, amountUsd, overrideBaseUnits } = params;
 
     // Check token validity before API calls — if expired, re-login
     try {
@@ -842,19 +839,10 @@ export class PhoenixService {
       } else {
         const bestBid = orderbook.bids[0]?.[0] ?? midPrice;
         const bestAsk = orderbook.asks[0]?.[0] ?? midPrice;
-        // For closes (useMidPrice): place BEYOND opposite side for guaranteed maker fill.
-        // Sell limit slightly BELOW bestBid → fills against resting bids (maker).
-        // Buy limit slightly ABOVE bestAsk → fills against resting asks (maker).
-        let limitPrice: number;
-        if (useMidPrice) {
-          const offset = midPrice * (CLOSE_MAKER_OFFSET_BPS / 10000);
-          limitPrice = executionSide === 'short'
-            ? bestBid - offset   // selling to close long: just below bestBid
-            : bestAsk + offset;  // buying to close short: just above bestAsk
-        } else {
-          // For opens: passive maker on same side
-          limitPrice = executionSide === 'long' ? bestBid : bestAsk;
-        }
+        // Same-side placement = MAKER fee.
+        // Sell limit at bestAsk → rests on ask side, fills when market buyer hits it.
+        // Buy limit at bestBid → rests on bid side, fills when market seller hits it.
+        const limitPrice = executionSide === 'long' ? bestBid : bestAsk;
 
         console.log(
           `  📋 Limit ${executionSide.toUpperCase()} @ ${limitPrice} (mid: ${midPrice}, spread: ${(

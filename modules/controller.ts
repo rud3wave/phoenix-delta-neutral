@@ -14,6 +14,7 @@ import {
   MARGIN_RANGE,
   MAX_SPREAD,
   LIMIT_FILL_TIMEOUT_MINUTES,
+  CLOSE_LIMIT_TIMEOUT_MINUTES,
   DELAY_AFTER_LEADER_FILL,
   HOLD_MINUTES,
   TRADES_COUNT,
@@ -649,11 +650,38 @@ export class DeltaNeutralController {
       }
     }
 
-    // Step 8: Wait for limit closes
-    await Promise.all(
-      limitCloseAccounts.map((acc) => this.waitForPositionClose(acc, srcToken))
+    // Step 8: Wait for limit closes WITH timeout → fallback to market
+    const closeTimeoutMs = CLOSE_LIMIT_TIMEOUT_MINUTES * 60 * 1000;
+    const limitCloseResults = await Promise.allSettled(
+      limitCloseAccounts.map((acc) => this.waitForPositionClose(acc, srcToken, closeTimeoutMs))
     );
-    console.log(`  ✅ ${limitCloseSide.toUpperCase()} group closed (maker fee)`);
+
+    const unfilledAccounts: GroupAccount[] = [];
+    for (let i = 0; i < limitCloseAccounts.length; i++) {
+      const result = limitCloseResults[i]!;
+      const acc = limitCloseAccounts[i]!;
+      if (result.status === 'rejected') {
+        console.log(`  ⚠️ Limit close timeout for ${shortAddr(acc.address)} — falling back to MARKET`);
+        unfilledAccounts.push(acc);
+      }
+    }
+
+    // Cancel unfilled limit orders and close via market
+    for (const acc of unfilledAccounts) {
+      try {
+        await acc.service.cancelAllOrders(srcToken);
+        await acc.service.closeAllPositionsAndOrders();
+        console.log(`  ✅ ${shortAddr(acc.address)} closed via MARKET (fallback)`);
+      } catch (e: any) {
+        console.log(`  ❌ Market fallback failed for ${shortAddr(acc.address)}: ${e.message}`);
+      }
+    }
+
+    if (unfilledAccounts.length === 0) {
+      console.log(`  ✅ ${limitCloseSide.toUpperCase()} group closed (maker fee)`);
+    } else {
+      console.log(`  ✅ ${limitCloseSide.toUpperCase()} group closed (${limitCloseAccounts.length - unfilledAccounts.length} maker + ${unfilledAccounts.length} taker fallback)`);
+    }
 
     // Step 9: Delay before market close
     if (!isRangeEmpty(DELAY_AFTER_LEADER_FILL)) {
@@ -747,9 +775,16 @@ export class DeltaNeutralController {
 
   private async waitForPositionClose(
     account: GroupAccount,
-    srcToken: string
+    srcToken: string,
+    timeoutMs: number = 0
   ): Promise<void> {
+    const startTime = Date.now();
+
     while (true) {
+      if (timeoutMs > 0 && Date.now() - startTime > timeoutMs) {
+        throw new Error(`Close timeout for ${shortAddr(account.address)}`);
+      }
+
       try {
         const state = await account.service.getPositions();
         const subaccounts = state.snapshot?.subaccounts ?? [];
@@ -764,8 +799,10 @@ export class DeltaNeutralController {
         }
 
         if (!hasPosition) return;
-      } catch {
-        // retry
+      } catch (e: any) {
+        // Don't swallow timeout errors
+        if (e.message?.includes('Close timeout')) throw e;
+        // retry on other errors
       }
 
       await sleep(POLL_INTERVAL_SEC);

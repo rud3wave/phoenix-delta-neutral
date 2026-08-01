@@ -153,6 +153,7 @@ export interface PlacePositionOrderParams {
   overrideBaseUnits?: number;
   takeProfitPricePercent?: number;
   stopLossPricePercent?: number;
+  useMidPrice?: boolean;
 }
 
 // ==================== SERVICE ====================
@@ -669,6 +670,7 @@ export class PhoenixService {
       executionType: 'limit',
       amountUsd: 0,
       overrideBaseUnits: baseUnits,
+      useMidPrice: true,
     });
   }
 
@@ -779,7 +781,7 @@ export class PhoenixService {
   // ==================== TRADING (Rise SDK) ====================
 
   public async placePositionOrder(params: PlacePositionOrderParams): Promise<{ rfqId: string }> {
-    const { instrument, executionSide, executionType, amountUsd, overrideBaseUnits } = params;
+    const { instrument, executionSide, executionType, amountUsd, overrideBaseUnits, useMidPrice } = params;
 
     // Check token validity before API calls — if expired, re-login
     try {
@@ -839,7 +841,11 @@ export class PhoenixService {
       } else {
         const bestBid = orderbook.bids[0]?.[0] ?? midPrice;
         const bestAsk = orderbook.asks[0]?.[0] ?? midPrice;
-        const limitPrice = executionSide === 'long' ? bestBid : bestAsk;
+        // For closes (useMidPrice): place at mid for faster fill while staying maker.
+        // For opens: place at same side (passive maker).
+        const limitPrice = useMidPrice
+          ? midPrice
+          : (executionSide === 'long' ? bestBid : bestAsk);
 
         console.log(
           `  📋 Limit ${executionSide.toUpperCase()} @ ${limitPrice} (mid: ${midPrice}, spread: ${(

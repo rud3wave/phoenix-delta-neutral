@@ -24,10 +24,27 @@ export const TOKENS_TO_TRADE = ['ETH', 'SOL', 'BTC'];
 
 // --- НАСТРОЙКИ ПОЗИЦИЙ ---
 
-// MARGIN_RANGE НЕ используется в расчёте позиций (cross margin).
-// В кросс-марже весь баланс = коллатераль, поэтому notional = balance × leverage.
-// Effective leverage на сайте = LEVERAGE_RANGE напрямую.
-// Оставлено для совместимости / будущих режимов.
+// --- КАК РАБОТАЕТ ПЛЕЧО И РАЗМЕР ПОЗИЦИИ (CROSS MARGIN) ---
+//
+// На Phoenix НЕТ изолированной маржи — только cross margin.
+// Это значит: ВЕСЬ баланс кошелька = коллатераль для всех позиций.
+//
+// Как сайт считает effective leverage:
+//   effective_leverage = position_value (notional) / balance
+//
+// Как софт считает размер позиции:
+//   notional = balance × leverage   (где leverage — рандом из LEVERAGE_RANGE)
+//
+// Пример: баланс $1000, leverage = 10x
+//   notional = $1000 × 10 = $10,000
+//   На сайте: effective leverage = $10,000 / $1000 = 10x ✓
+//   В логах бота: Lev: 10.0x ✓
+//
+// Итого: LEVERAGE_RANGE = [7, 15] → на сайте увидишь плечо от 7x до 15x.
+// Цифры в настройках = цифры на сайте = цифры в логах. Всё совпадает.
+//
+// MARGIN_MODE и MARGIN_RANGE ниже — НЕ влияют на расчёт в cross margin.
+// Оставлены для совместимости / будущих режимов. Не трогай.
 export const MARGIN_MODE = 'percent';
 export const MARGIN_RANGE: [number, number] = [50, 60];
 

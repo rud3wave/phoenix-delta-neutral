@@ -88,5 +88,12 @@ export const DELAY_BETWEEN_WALLETS: [number, number] = [3, 8];
 // Интервал поллинга позиций (секунды)
 export const POLL_INTERVAL_SEC = 5;
 
+// --- ЗАЩИТА ОТ ЛИКВИДАЦИИ ---
+
+// Минимальное расстояние до ликвидации (%) для каждого кошелька.
+// Если расчётная ликвидация ближе — группа пересчитывается.
+// 0 = отключено (без проверки)
+export const MIN_LIQUIDATION_DISTANCE = 15;
+
 // --- SLIPPAGE ---
 export const SLIPPAGE = 0.02;

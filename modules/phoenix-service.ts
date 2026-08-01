@@ -47,6 +47,7 @@ import {
   type SolanaInstruction,
   type TraderStateResponse,
 } from './phoenix-api.js';
+import { CLOSE_MAKER_OFFSET_BPS } from '../settings.js';
 
 // ==================== CONFIG ====================
 
@@ -841,11 +842,19 @@ export class PhoenixService {
       } else {
         const bestBid = orderbook.bids[0]?.[0] ?? midPrice;
         const bestAsk = orderbook.asks[0]?.[0] ?? midPrice;
-        // For closes (useMidPrice): place at mid for faster fill while staying maker.
-        // For opens: place at same side (passive maker).
-        const limitPrice = useMidPrice
-          ? midPrice
-          : (executionSide === 'long' ? bestBid : bestAsk);
+        // For closes (useMidPrice): place BEYOND opposite side for guaranteed maker fill.
+        // Sell limit slightly BELOW bestBid → fills against resting bids (maker).
+        // Buy limit slightly ABOVE bestAsk → fills against resting asks (maker).
+        let limitPrice: number;
+        if (useMidPrice) {
+          const offset = midPrice * (CLOSE_MAKER_OFFSET_BPS / 10000);
+          limitPrice = executionSide === 'short'
+            ? bestBid - offset   // selling to close long: just below bestBid
+            : bestAsk + offset;  // buying to close short: just above bestAsk
+        } else {
+          // For opens: passive maker on same side
+          limitPrice = executionSide === 'long' ? bestBid : bestAsk;
+        }
 
         console.log(
           `  📋 Limit ${executionSide.toUpperCase()} @ ${limitPrice} (mid: ${midPrice}, spread: ${(

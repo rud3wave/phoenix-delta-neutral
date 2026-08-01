@@ -75,7 +75,13 @@ export const TRADES_COUNT: [number, number] = [2, 5];
 export const CLOSE_TYPE: 'limit' | 'market' = 'limit';
 
 // Таймаут ожидания лимитки при закрытии (минуты)
-export const CLOSE_LIMIT_TIMEOUT_MINUTES = 3;
+export const CLOSE_LIMIT_TIMEOUT_MINUTES = 5;
+
+// Смещение лимитки закрытия за противоположную сторону стакана (в bps).
+// Гарантирует maker-fill: sell limit ставится ЧУТЬ НИЖЕ bestBid,
+// buy limit — ЧУТЬ ВЫШЕ bestAsk. Филится мгновенно о resting orders.
+// 3 bps на ETH ($3500) ≈ $1.05 — щадяще но стабильно.
+export const CLOSE_MAKER_OFFSET_BPS = 3;
 
 // --- ЗАДЕРЖКИ (секунды) [мин, макс] ---
 

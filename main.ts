@@ -10,6 +10,7 @@ import { createInterface } from 'node:readline';
 
 import { SHUFFLE_WALLETS } from './settings.js';
 import { DeltaNeutralController } from './modules/controller.js';
+import { closeLeaderFollower } from './modules/close-strategy.js';
 import { PhoenixService } from './modules/phoenix-service.js';
 import { sendTg } from './modules/telegram.js';
 import {
@@ -140,9 +141,10 @@ async function runDeltaNeutral(services: PhoenixService[]): Promise<void> {
 // ==================== MODE 2: CLOSE ALL ====================
 
 async function closeAllPositions(services: PhoenixService[]): Promise<void> {
-  console.log('\n🔄 Closing all positions and orders...');
+  console.log('\n🔄 Closing all positions (leader LIMIT → follower MARKET)...');
 
-  const results = await Promise.all(services.map(async (service) => {
+  // Step 1: Snapshot balances + open positions per wallet
+  const snapshot = await Promise.all(services.map(async (service) => {
     const addr = shortAddr(service.getAddress());
     try {
       const balanceBefore = await service.getUsdcBalance();
@@ -151,40 +153,65 @@ async function closeAllPositions(services: PhoenixService[]): Promise<void> {
       const side = positions.length
         ? [...positions].sort((a, b) => b.positionUsd - a.positionUsd)[0]!.side
         : null;
-
-      console.log(`  📋 ${addr} — closing...`);
-      await service.closeAllPositionsAndOrders();
-
-      const balanceAfter = await service.getUsdcBalance();
-      const pnl = balanceAfter - balanceBefore;
-
-      if (side) {
-        const emoji = side === 'long' ? '🟢' : '🔴';
-        const sideLabel = side === 'long' ? 'LONG' : 'SHORT';
-        const pnlSign = pnl >= 0 ? '+' : '';
-        const pnlEmoji = pnl >= 0 ? '📈' : '📉';
-        const line =
-          `${emoji} ${sideLabel} ${addr} | ${pnlEmoji} PnL: ${pnlSign}${pnl.toFixed(4)}$ | ` +
-          `Bal: $${balanceAfter.toFixed(2)} | Vol: $${volume.toFixed(2)}`;
-        console.log(`  ✅ ${line}`);
-        return { line, pnl, volume };
-      } else {
-        console.log(`  ✅ ${addr} — no open positions`);
-        return { line: `⚪ ${addr} | no open positions | Bal: $${balanceAfter.toFixed(2)}`, pnl: 0, volume: 0 };
-      }
+      return { service, addr, balanceBefore, positions, volume, side, error: null as string | null };
     } catch (e: any) {
-      console.log(`  ❌ ${addr} — failed: ${e.message}`);
-      return { line: `❌ ${addr} | error: ${e.message}`, pnl: 0, volume: 0 };
+      console.log(`  ❌ ${addr} — snapshot failed: ${e.message}`);
+      return { service, addr, balanceBefore: 0, positions: [], volume: 0, side: null, error: e.message as string };
     }
   }));
 
+  // Step 2: Group positioned wallets by symbol, close leader-limit / follower-market
+  const bySymbol = new Map<string, { service: PhoenixService; side: 'long' | 'short'; positionUsd: number }[]>();
+  for (const s of snapshot) {
+    for (const p of s.positions) {
+      if (!bySymbol.has(p.symbol)) bySymbol.set(p.symbol, []);
+      bySymbol.get(p.symbol)!.push({ service: s.service, side: p.side, positionUsd: p.positionUsd });
+    }
+  }
+
+  for (const [symbol, entries] of bySymbol) {
+    // Leader side = side of the single largest position
+    const biggest = entries.reduce((a, b) => (b.positionUsd > a.positionUsd ? b : a));
+    const limitSide = biggest.side;
+    const limitAccounts = entries.filter((e) => e.side === limitSide);
+    const marketAccounts = entries.filter((e) => e.side !== limitSide);
+    await closeLeaderFollower(limitAccounts, marketAccounts, symbol);
+  }
+
+  // Step 3: Report per-wallet PnL
   const lines: string[] = ['📂 POSITIONS CLOSED | Force close', ''];
   let totalPnl = 0;
   let totalVolume = 0;
-  for (const r of results) {
-    lines.push(r.line);
-    totalPnl += r.pnl;
-    totalVolume += r.volume;
+
+  for (const s of snapshot) {
+    if (s.error) {
+      lines.push(`❌ ${s.addr} | error: ${s.error}`);
+      continue;
+    }
+    try {
+      const balanceAfter = await s.service.getUsdcBalance();
+      const pnl = balanceAfter - s.balanceBefore;
+      totalPnl += pnl;
+      totalVolume += s.volume;
+
+      if (s.side) {
+        const emoji = s.side === 'long' ? '🟢' : '🔴';
+        const sideLabel = s.side === 'long' ? 'LONG' : 'SHORT';
+        const pnlSign = pnl >= 0 ? '+' : '';
+        const pnlEmoji = pnl >= 0 ? '📈' : '📉';
+        const line =
+          `${emoji} ${sideLabel} ${s.addr} | ${pnlEmoji} PnL: ${pnlSign}${pnl.toFixed(4)}$ | ` +
+          `Bal: $${balanceAfter.toFixed(2)} | Vol: $${s.volume.toFixed(2)}`;
+        console.log(`  ✅ ${line}`);
+        lines.push(line);
+      } else {
+        console.log(`  ✅ ${s.addr} — no open positions`);
+        lines.push(`⚪ ${s.addr} | no open positions | Bal: $${balanceAfter.toFixed(2)}`);
+      }
+    } catch (e: any) {
+      console.log(`  ❌ ${s.addr} — failed: ${e.message}`);
+      lines.push(`❌ ${s.addr} | error: ${e.message}`);
+    }
   }
 
   const costPer100k = totalVolume > 0 ? (-totalPnl / totalVolume) * 100_000 : 0;

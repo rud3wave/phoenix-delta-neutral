@@ -10,10 +10,16 @@ export const SHUFFLE_WALLETS = true;
 // Количество попыток при ошибке
 export const RETRY = 3;
 
+// --- ЛОГИКА ИСПОЛНЕНИЯ ---
+// Как открывать и закрывать позиции:
+//   'leader-follower' = лидер (крупнейшая позиция) — лимитка (maker), фолловер — маркет (taker) после филла
+//   'all-market'      = всё маркетом (быстро, но taker-комиссия со всего объёма)
+export const EXECUTION_MODE: 'leader-follower' | 'all-market' = 'leader-follower';
+
 // --- ТОКЕНЫ ---
 // Single token → ['ETH'] — все группы торгуют только ETH
 // Multi token  → ['ETH', 'SOL', 'BTC'] — каждая группа рандомно выберет один
-export const TOKENS_TO_TRADE = ['ETH', 'SOL', 'BTC'];
+export const TOKENS_TO_TRADE = ['ETH'];
 
 // --- РАЗМЕР ПОЗИЦИИ ---
 // Какой % баланса задействовать
@@ -27,8 +33,8 @@ export const POSITION_PERCENT = [60, 70];
 //   ETH макс 25x | SOL макс 25x | BTC макс 40x
 export const TOKEN_LEVERAGE = {
   ETH: [7, 15],
-  SOL: [7, 15],
-  BTC: [7, 15],
+  // SOL: [7, 15],
+  // BTC: [7, 15],
 };
 
 // --- ГРУППЫ ---
@@ -53,8 +59,8 @@ export const DELAY_AFTER_LEADER_FILL = [0, 1];
 // [0, 0] = держать бесконечно (закрытие вручную через режим 2)
 export const HOLD_MINUTES = [10000, 12000];
 
-// Количество торговых циклов (открытие → закрытие = 1 цикл) 
-export const TRADES_COUNT = [2, 5];
+// Количество торговых циклов (открытие → закрытие = 1 цикл) — одинаково для всех кошельков
+export const TRADES_COUNT = 3;
 
 // --- ЗАДЕРЖКИ (секунды) ---
 

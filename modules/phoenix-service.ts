@@ -670,6 +670,30 @@ export class PhoenixService {
     });
   }
 
+  public async closePositionByMarket(symbol: string): Promise<void> {
+    const state = await this.getPositions();
+    const position = this.findPosition(state, symbol);
+
+    if (!position) {
+      console.log(`  ℹ️ No open position for ${symbol} to close`);
+      return;
+    }
+
+    await this.getBaseLotsDecimals(symbol);
+    const baseUnits = this.lotsToBaseUnits(Math.abs(Number(position.basePositionLots)), symbol);
+    const closeSide = Number(position.basePositionLots) > 0 ? 'short' : 'long';
+
+    console.log(`  🚀 Closing ${symbol} via MARKET | ${closeSide.toUpperCase()} | ${parseFloat(baseUnits.toFixed(6))} ${symbol}`);
+
+    await this.placePositionOrder({
+      instrument: symbol,
+      executionSide: closeSide as 'long' | 'short',
+      executionType: 'market',
+      amountUsd: 0,
+      overrideBaseUnits: baseUnits,
+    });
+  }
+
   // ==================== MARKET MONITORING ====================
 
   public async getMarketSnapshot(symbol: string): Promise<MarketSnapshot> {

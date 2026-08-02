@@ -19,8 +19,10 @@ import {
   POLL_INTERVAL_SEC,
   TOKENS_TO_TRADE,
   RETRY,
+  EXECUTION_MODE,
 } from '../settings.js';
 import { PhoenixService } from './phoenix-service.js';
+import { closeLeaderFollower } from './close-strategy.js';
 import { sendTg } from './telegram.js';
 import {
   sleep,
@@ -71,7 +73,7 @@ export class DeltaNeutralController {
       balanceAfter: 0,
       failures: 0,
       tradesCompleted: 0,
-      targetTrades: getRandomNumber(TRADES_COUNT, true),
+      targetTrades: TRADES_COUNT,
     };
     this.pool.push(account);
     console.log(`  📥 Registered ${shortAddr(account.address)} | Balance: $${balance.toFixed(2)} | Target trades: ${account.targetTrades}`);
@@ -465,8 +467,161 @@ export class DeltaNeutralController {
 
     console.log(`\n  🎯 LEADER: ${limitSide.toUpperCase()} (${limitAccounts.length}) via LIMIT | FOLLOWER: ${marketSide.toUpperCase()} (${marketAccounts.length}) via MARKET`);
 
-    // ========== OPEN — Leader LIMIT + Follower MARKET ==========
+    // ========== OPEN ==========
+    if (EXECUTION_MODE === 'all-market') {
+      await this.openAllMarket(accounts, srcToken);
+    } else {
+      await this.openLeaderFollower(srcToken, limitSide, marketSide, limitAccounts, marketAccounts);
+    }
 
+    // Step 6: Verify positions + log liquidation info
+    console.log('\n  🔍 Verifying positions...');
+    for (const acc of accounts) {
+      try {
+        const liq = await acc.service.getPositionWithLiquidation(srcToken);
+        if (liq.hasPosition) {
+          console.log(
+            `  ${acc.side === 'long' ? '🟢' : '🔴'} ${shortAddr(acc.address)} | ` +
+            `${liq.side!.toUpperCase()} $${liq.positionUsd.toFixed(2)} | ` +
+            `Lev: ${liq.effectiveLeverage.toFixed(1)}x | ` +
+            `Liq: ${liq.liqDistancePercent.toFixed(1)}% away`
+          );
+        }
+      } catch {
+        // non-critical
+      }
+    }
+
+    // ========== TG #1: POSITIONS OPENED ==========
+    {
+      const lines: string[] = [];
+      lines.push(`📂 POSITIONS OPENED | Group ${id}`);
+
+      try {
+        const snap = await accounts[0]!.service.getMarketSnapshot(srcToken);
+        lines.push(`📊 ${srcToken} | Spread: ${snap.spreadPercent.toFixed(4)}% | Mid: $${snap.midPrice.toFixed(2)}`);
+      } catch {
+        lines.push(srcToken);
+      }
+      lines.push('');
+
+      for (const acc of accounts) {
+        try {
+          const liq = await acc.service.getPositionWithLiquidation(srcToken);
+          const emoji = acc.side === 'long' ? '🟢' : '🔴';
+          const side = acc.side === 'long' ? 'LONG' : 'SHORT';
+          lines.push(
+            `${emoji} ${side} ${shortAddr(acc.address)} | $${liq.positionUsd.toFixed(2)} | ` +
+            `Lev: ${liq.effectiveLeverage.toFixed(1)}x | ` +
+            `Liq: ${liq.liqDistancePercent.toFixed(1)}%`
+          );
+        } catch {
+          const emoji = acc.side === 'long' ? '🟢' : '🔴';
+          lines.push(`${emoji} ${acc.side === 'long' ? 'LONG' : 'SHORT'} ${shortAddr(acc.address)} | error`);
+        }
+      }
+
+      const longTotal = accounts.filter((a) => a.side === 'long').reduce((s, a) => s + (a.orderAmount ?? 0), 0);
+      const shortTotal = accounts.filter((a) => a.side === 'short').reduce((s, a) => s + (a.orderAmount ?? 0), 0);
+      lines.push('');
+      lines.push(`🟢 LONG: $${longTotal.toFixed(2)} | 🔴 SHORT: $${shortTotal.toFixed(2)}`);
+
+      await sendTg(lines.join('\n'));
+    }
+
+    // ========== HOLD ==========
+
+    if (!isRangeEmpty(HOLD_MINUTES)) {
+      const holdMinutes = getRandomNumber(HOLD_MINUTES);
+      console.log(`\n  ⏸️ Holding positions for ${holdMinutes.toFixed(1)} min (quiet hold)...`);
+      await sleep(holdMinutes * 60);
+      console.log('  ⏸️ Hold complete');
+    } else {
+      console.log('\n  ⏸️ Holding indefinitely — close manually via mode 2');
+      // Wait until stopped
+      while (this.isRunning) {
+        await sleep(60);
+      }
+      return;
+    }
+
+    // ========== CLOSE — Leader LIMIT first, then Follower MARKET ==========
+    await closeLeaderFollower(limitAccounts, marketAccounts, srcToken);
+
+    // ========== TG #2: POSITIONS CLOSED + PnL ==========
+    {
+      const lines: string[] = [];
+      lines.push(`📂 POSITIONS CLOSED | Group ${id}`);
+      lines.push('');
+
+      let totalPnl = 0;
+      let totalVolume = 0;
+
+      for (const acc of accounts) {
+        try {
+          const bal = await acc.service.getUsdcBalance();
+          acc.balanceAfter = bal;
+          const pnl = bal - acc.balanceBefore;
+          totalPnl += pnl;
+          totalVolume += acc.orderAmount ?? 0;
+
+          const emoji = acc.side === 'long' ? '🟢' : '🔴';
+          const side = acc.side === 'long' ? 'LONG' : 'SHORT';
+          const pnlSign = pnl >= 0 ? '+' : '';
+          const pnlEmoji = pnl >= 0 ? '📈' : '📉';
+          lines.push(
+            `${emoji} ${side} ${shortAddr(acc.address)} | ${pnlEmoji} PnL: ${pnlSign}${pnl.toFixed(4)}$ | ` +
+            `Bal: $${bal.toFixed(2)} | Vol: $${(acc.orderAmount ?? 0).toFixed(2)}`
+          );
+        } catch {
+          const emoji = acc.side === 'long' ? '🟢' : '🔴';
+          lines.push(`${emoji} ${acc.side === 'long' ? 'LONG' : 'SHORT'} ${shortAddr(acc.address)} | error`);
+        }
+      }
+
+      const costPer100k = totalVolume > 0 ? (-totalPnl / totalVolume) * 100000 : 0;
+      const pnlSign = totalPnl >= 0 ? '+' : '';
+      const totalEmoji = totalPnl >= 0 ? '📈' : '📉';
+
+      lines.push('');
+      lines.push(`${totalEmoji} Total PnL: ${pnlSign}${totalPnl.toFixed(4)}$`);
+      lines.push(`💰 Total Volume: $${totalVolume.toFixed(2)}`);
+      lines.push(` Cost per 100k: ${costPer100k.toFixed(3)}$`);
+
+      await sendTg(lines.join('\n'));
+    }
+  }
+
+  // ==================== OPEN VARIANTS ====================
+
+  /** all-market: open every wallet by market at once (no maker/taker split). */
+  private async openAllMarket(accounts: GroupAccount[], srcToken: string): Promise<void> {
+    console.log(`\n  🚀 ALL-MARKET mode — opening ALL ${accounts.length} via MARKET...`);
+    await Promise.all(accounts.map(async (acc) => {
+      try {
+        await acc.service.placePositionOrder({
+          instrument: srcToken,
+          executionSide: acc.side!,
+          executionType: 'market',
+          amountUsd: acc.orderAmount!,
+          leverage: acc.leverage,
+        });
+        console.log(`  ✅ ${shortAddr(acc.address)} MARKET open filled`);
+      } catch (e: any) {
+        console.log(`  ❌ MARKET open failed for ${shortAddr(acc.address)}: ${e.message}`);
+        acc.failures++;
+      }
+    }));
+  }
+
+  /** leader-follower: leader LIMIT (maker) → wait fill → follower MARKET (taker, delta-matched). */
+  private async openLeaderFollower(
+    srcToken: string,
+    limitSide: 'long' | 'short',
+    marketSide: 'long' | 'short',
+    limitAccounts: GroupAccount[],
+    marketAccounts: GroupAccount[]
+  ): Promise<void> {
     // Leader places LIMIT orders (parallel)
     console.log(`\n  📋 ${limitSide.toUpperCase()} placing LIMIT orders...`);
     const pendingLeader = new Set(limitAccounts);
@@ -577,185 +732,6 @@ export class DeltaNeutralController {
         acc.failures++;
       }
     }));
-
-    // Step 6: Verify positions + log liquidation info
-    console.log('\n  🔍 Verifying positions...');
-    for (const acc of accounts) {
-      try {
-        const liq = await acc.service.getPositionWithLiquidation(srcToken);
-        if (liq.hasPosition) {
-          console.log(
-            `  ${acc.side === 'long' ? '🟢' : '🔴'} ${shortAddr(acc.address)} | ` +
-            `${liq.side!.toUpperCase()} $${liq.positionUsd.toFixed(2)} | ` +
-            `Lev: ${liq.effectiveLeverage.toFixed(1)}x | ` +
-            `Liq: ${liq.liqDistancePercent.toFixed(1)}% away`
-          );
-        }
-      } catch {
-        // non-critical
-      }
-    }
-
-    // ========== TG #1: POSITIONS OPENED ==========
-    {
-      const lines: string[] = [];
-      lines.push(`📂 POSITIONS OPENED | Group ${id}`);
-
-      try {
-        const snap = await accounts[0]!.service.getMarketSnapshot(srcToken);
-        lines.push(`📊 ${srcToken} | Spread: ${snap.spreadPercent.toFixed(4)}% | Mid: $${snap.midPrice.toFixed(2)}`);
-      } catch {
-        lines.push(srcToken);
-      }
-      lines.push('');
-
-      for (const acc of accounts) {
-        try {
-          const liq = await acc.service.getPositionWithLiquidation(srcToken);
-          const emoji = acc.side === 'long' ? '🟢' : '🔴';
-          const side = acc.side === 'long' ? 'LONG' : 'SHORT';
-          lines.push(
-            `${emoji} ${side} ${shortAddr(acc.address)} | $${liq.positionUsd.toFixed(2)} | ` +
-            `Lev: ${liq.effectiveLeverage.toFixed(1)}x | ` +
-            `Liq: ${liq.liqDistancePercent.toFixed(1)}%`
-          );
-        } catch {
-          const emoji = acc.side === 'long' ? '🟢' : '🔴';
-          lines.push(`${emoji} ${acc.side === 'long' ? 'LONG' : 'SHORT'} ${shortAddr(acc.address)} | error`);
-        }
-      }
-
-      const longTotal = accounts.filter((a) => a.side === 'long').reduce((s, a) => s + (a.orderAmount ?? 0), 0);
-      const shortTotal = accounts.filter((a) => a.side === 'short').reduce((s, a) => s + (a.orderAmount ?? 0), 0);
-      lines.push('');
-      lines.push(`🟢 LONG: $${longTotal.toFixed(2)} | 🔴 SHORT: $${shortTotal.toFixed(2)}`);
-
-      await sendTg(lines.join('\n'));
-    }
-
-    // ========== HOLD ==========
-
-    if (!isRangeEmpty(HOLD_MINUTES)) {
-      const holdMinutes = getRandomNumber(HOLD_MINUTES);
-      console.log(`\n  ⏸️ Holding positions for ${holdMinutes.toFixed(1)} min (quiet hold)...`);
-      await sleep(holdMinutes * 60);
-      console.log('  ⏸️ Hold complete');
-    } else {
-      console.log('\n  ⏸️ Holding indefinitely — close manually via mode 2');
-      // Wait until stopped
-      while (this.isRunning) {
-        await sleep(60);
-      }
-      return;
-    }
-
-    // ========== CLOSE — ALL wallets via LIMIT ==========
-
-    console.log(`\n  📋 Closing ALL ${accounts.length} wallets via LIMIT (maker)...`);
-    const pendingClose = new Set(accounts);
-
-    // Initial placement
-    await Promise.all(accounts.map(async (acc) => {
-      try {
-        await acc.service.closePositionByLimit(srcToken);
-      } catch (e: any) {
-        console.log(`  ⚠️ Limit close failed for ${shortAddr(acc.address)}: ${e.message}`);
-      }
-    }));
-
-    // Retry loop: wait → check → re-place unfilled
-    let closeRetryCount = 0;
-
-    while (pendingClose.size > 0) {
-      closeRetryCount++;
-      console.log(`\n  ⏳ Waiting 10s for close fills (attempt ${closeRetryCount})...`);
-      await sleep(10);
-
-      const stillOpen: GroupAccount[] = [];
-      for (const acc of pendingClose) {
-        try {
-          const state = await acc.service.getPositions();
-          const subaccounts = state.snapshot?.subaccounts ?? [];
-          let hasPosition = false;
-          for (const sub of subaccounts) {
-            const positions = sub.positions ?? [];
-            if (positions.some((p) => p.symbol === srcToken && Number(p.basePositionLots) !== 0)) {
-              hasPosition = true;
-              break;
-            }
-          }
-          if (hasPosition) {
-            stillOpen.push(acc);
-          } else {
-            console.log(`  ✅ ${shortAddr(acc.address)} closed via LIMIT (maker)`);
-          }
-        } catch {
-          stillOpen.push(acc);
-        }
-      }
-
-      for (const acc of pendingClose) {
-        if (!stillOpen.includes(acc)) pendingClose.delete(acc);
-      }
-
-      if (pendingClose.size === 0) break;
-
-      // Re-place unfilled
-      console.log(`  🔄 ${pendingClose.size} limit(s) unfilled — cancelling & re-placing...`);
-      await Promise.all(stillOpen.map(async (acc) => {
-        try {
-          await acc.service.cancelAllOrders(srcToken);
-          await acc.service.closePositionByLimit(srcToken);
-        } catch (e: any) {
-          console.log(`  ⚠️ Re-place failed for ${shortAddr(acc.address)}: ${e.message}`);
-        }
-      }));
-    }
-
-    console.log(`  ✅ All positions closed via LIMIT (maker) after ${closeRetryCount} attempt(s)`);
-
-    // ========== TG #2: POSITIONS CLOSED + PnL ==========
-    {
-      const lines: string[] = [];
-      lines.push(`📂 POSITIONS CLOSED | Group ${id}`);
-      lines.push('');
-
-      let totalPnl = 0;
-      let totalVolume = 0;
-
-      for (const acc of accounts) {
-        try {
-          const bal = await acc.service.getUsdcBalance();
-          acc.balanceAfter = bal;
-          const pnl = bal - acc.balanceBefore;
-          totalPnl += pnl;
-          totalVolume += acc.orderAmount ?? 0;
-
-          const emoji = acc.side === 'long' ? '🟢' : '🔴';
-          const side = acc.side === 'long' ? 'LONG' : 'SHORT';
-          const pnlSign = pnl >= 0 ? '+' : '';
-          const pnlEmoji = pnl >= 0 ? '📈' : '📉';
-          lines.push(
-            `${emoji} ${side} ${shortAddr(acc.address)} | ${pnlEmoji} PnL: ${pnlSign}${pnl.toFixed(4)}$ | ` +
-            `Bal: $${bal.toFixed(2)} | Vol: $${(acc.orderAmount ?? 0).toFixed(2)}`
-          );
-        } catch {
-          const emoji = acc.side === 'long' ? '🟢' : '🔴';
-          lines.push(`${emoji} ${acc.side === 'long' ? 'LONG' : 'SHORT'} ${shortAddr(acc.address)} | error`);
-        }
-      }
-
-      const costPer100k = totalVolume > 0 ? (-totalPnl / totalVolume) * 100000 : 0;
-      const pnlSign = totalPnl >= 0 ? '+' : '';
-      const totalEmoji = totalPnl >= 0 ? '📈' : '📉';
-
-      lines.push('');
-      lines.push(`${totalEmoji} Total PnL: ${pnlSign}${totalPnl.toFixed(4)}$`);
-      lines.push(`💰 Total Volume: $${totalVolume.toFixed(2)}`);
-      lines.push(` Cost per 100k: ${costPer100k.toFixed(3)}$`);
-
-      await sendTg(lines.join('\n'));
-    }
   }
 
   // ==================== WAIT HELPERS ====================

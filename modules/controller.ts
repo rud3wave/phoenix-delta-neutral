@@ -249,31 +249,35 @@ export class DeltaNeutralController {
         }
       }));
 
-      // Retry until all closed
+      // Retry until all closed: poll every 1s up to 2min, then re-place unfilled
       while (pendingCleanup.size > 0) {
-        await sleep(10);
+        let stillOpen: GroupAccount[] = [];
 
-        const stillOpen: GroupAccount[] = [];
-        for (const acc of pendingCleanup) {
-          try {
-            const state = await acc.service.getPositions();
-            const subaccounts = state.snapshot?.subaccounts ?? [];
-            let hasPosition = false;
-            for (const sub of subaccounts) {
-              const positions = sub.positions ?? [];
-              if (positions.some((p) => p.symbol === srcToken && Number(p.basePositionLots) !== 0)) {
-                hasPosition = true;
-                break;
+        for (let i = 0; i < 120 && pendingCleanup.size > 0; i++) {
+          await sleep(1);
+
+          stillOpen = [];
+          for (const acc of pendingCleanup) {
+            try {
+              const state = await acc.service.getPositions();
+              const subaccounts = state.snapshot?.subaccounts ?? [];
+              let hasPosition = false;
+              for (const sub of subaccounts) {
+                const positions = sub.positions ?? [];
+                if (positions.some((p) => p.symbol === srcToken && Number(p.basePositionLots) !== 0)) {
+                  hasPosition = true;
+                  break;
+                }
               }
+              if (hasPosition) stillOpen.push(acc);
+            } catch {
+              stillOpen.push(acc);
             }
-            if (hasPosition) stillOpen.push(acc);
-          } catch {
-            stillOpen.push(acc);
           }
-        }
 
-        for (const acc of pendingCleanup) {
-          if (!stillOpen.includes(acc)) pendingCleanup.delete(acc);
+          for (const acc of pendingCleanup) {
+            if (!stillOpen.includes(acc)) pendingCleanup.delete(acc);
+          }
         }
 
         if (pendingCleanup.size === 0) break;
@@ -641,35 +645,40 @@ export class DeltaNeutralController {
       }
     }));
 
-    // Retry loop for leader: every 10s check + re-place unfilled
+    // Retry loop for leader: poll every 1s up to 2min, then re-place unfilled
+    console.log(`  ⏳ Waiting for leader fills (checking every 1s, up to 2min)...`);
     while (pendingLeader.size > 0) {
-      await sleep(10);
+      let stillWaiting: GroupAccount[] = [];
 
-      const stillWaiting: GroupAccount[] = [];
-      for (const acc of pendingLeader) {
-        try {
-          const state = await acc.service.getPositions();
-          const subaccounts = state.snapshot?.subaccounts ?? [];
-          let hasPosition = false;
-          for (const sub of subaccounts) {
-            const positions = sub.positions ?? [];
-            if (positions.some((p) => p.symbol === srcToken && Number(p.basePositionLots) !== 0)) {
-              hasPosition = true;
-              break;
+      for (let i = 0; i < 120 && pendingLeader.size > 0; i++) {
+        await sleep(1);
+
+        stillWaiting = [];
+        for (const acc of pendingLeader) {
+          try {
+            const state = await acc.service.getPositions();
+            const subaccounts = state.snapshot?.subaccounts ?? [];
+            let hasPosition = false;
+            for (const sub of subaccounts) {
+              const positions = sub.positions ?? [];
+              if (positions.some((p) => p.symbol === srcToken && Number(p.basePositionLots) !== 0)) {
+                hasPosition = true;
+                break;
+              }
             }
-          }
-          if (hasPosition) {
-            console.log(`  ✅ ${shortAddr(acc.address)} leader FILLED`);
-          } else {
+            if (hasPosition) {
+              console.log(`  ✅ ${shortAddr(acc.address)} leader FILLED`);
+            } else {
+              stillWaiting.push(acc);
+            }
+          } catch {
             stillWaiting.push(acc);
           }
-        } catch {
-          stillWaiting.push(acc);
         }
-      }
 
-      for (const acc of pendingLeader) {
-        if (!stillWaiting.includes(acc)) pendingLeader.delete(acc);
+        for (const acc of pendingLeader) {
+          if (!stillWaiting.includes(acc)) pendingLeader.delete(acc);
+        }
       }
 
       if (pendingLeader.size === 0) break;

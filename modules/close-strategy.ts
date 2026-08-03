@@ -57,39 +57,43 @@ export async function closeLeaderFollower(
     }
   }));
 
-  // Retry loop: wait → check → re-place unfilled
+  // Retry loop: poll every 1s up to 10s → re-place unfilled
   let closeRetryCount = 0;
 
   while (pendingClose.size > 0) {
     closeRetryCount++;
-    console.log(`\n  ⏳ Waiting 10s for leader close fills (attempt ${closeRetryCount})...`);
-    await sleep(10);
+    console.log(`\n  ⏳ Polling leader close fills every 1s, up to 2min (attempt ${closeRetryCount})...`);
+    let stillOpen: CloseAccount[] = [];
 
-    const stillOpen: CloseAccount[] = [];
-    for (const acc of pendingClose) {
-      try {
-        const state = await acc.service.getPositions();
-        const subaccounts = state.snapshot?.subaccounts ?? [];
-        let hasPosition = false;
-        for (const sub of subaccounts) {
-          const positions = sub.positions ?? [];
-          if (positions.some((p) => p.symbol === symbol && Number(p.basePositionLots) !== 0)) {
-            hasPosition = true;
-            break;
+    for (let i = 0; i < 120 && pendingClose.size > 0; i++) {
+      await sleep(1);
+
+      stillOpen = [];
+      for (const acc of pendingClose) {
+        try {
+          const state = await acc.service.getPositions();
+          const subaccounts = state.snapshot?.subaccounts ?? [];
+          let hasPosition = false;
+          for (const sub of subaccounts) {
+            const positions = sub.positions ?? [];
+            if (positions.some((p) => p.symbol === symbol && Number(p.basePositionLots) !== 0)) {
+              hasPosition = true;
+              break;
+            }
           }
-        }
-        if (hasPosition) {
+          if (hasPosition) {
+            stillOpen.push(acc);
+          } else {
+            console.log(`  ✅ ${shortAddr(acc.service.getAddress())} leader closed via LIMIT (maker)`);
+          }
+        } catch {
           stillOpen.push(acc);
-        } else {
-          console.log(`  ✅ ${shortAddr(acc.service.getAddress())} leader closed via LIMIT (maker)`);
         }
-      } catch {
-        stillOpen.push(acc);
       }
-    }
 
-    for (const acc of pendingClose) {
-      if (!stillOpen.includes(acc)) pendingClose.delete(acc);
+      for (const acc of pendingClose) {
+        if (!stillOpen.includes(acc)) pendingClose.delete(acc);
+      }
     }
 
     if (pendingClose.size === 0) break;

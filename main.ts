@@ -28,7 +28,7 @@ import { sleep, shuffleArray, shortAddr } from './modules/utils.js';
 function printBanner(): void {
   console.log(`
 ╔══════════════════════════════════════════════════╗
-║     🔥 PHOENIX DELTA-NEUTRAL VOLUME BOT 🔥      ║
+║     🔥 PHOENIX DELTA-NEUTRAL VOLUME BOT 🔥       ║
 ║                                                  ║
 ║     Phoenix Trade | Solana Perps                 ║
 ║     Delta-Neutral Volume Farming                 ║

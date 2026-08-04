@@ -62,3 +62,39 @@ export function shuffleArray<T>(arr: T[]): T[] {
 export function trimAmount(amount: number, token = 'USDC'): string {
   return `${amount.toFixed(2)} ${token}`;
 }
+
+// ==================== ERROR CLASSIFICATION ====================
+
+const NETWORK_ERROR_CODES = [
+  'ECONNRESET',
+  'ETIMEDOUT',
+  'ECONNREFUSED',
+  'ENOTFOUND',
+  'EAI_AGAIN',
+  'ECONNABORTED',
+  'EPIPE',
+  'ENETUNREACH',
+  'EHOSTUNREACH',
+  'EPROTO',
+];
+
+/** Check if an error is network-level (connection/proxy) — a candidate for proxy rotation */
+export function isNetworkError(e: unknown): boolean {
+  const err = e as { code?: string; message?: string } | null;
+  if (!err) return false;
+
+  if (err.code && NETWORK_ERROR_CODES.includes(err.code)) return true;
+
+  const msg = (err.message ?? '').toLowerCase();
+  return (
+    msg.includes('econnreset') ||
+    msg.includes('econnrefused') ||
+    msg.includes('enotfound') ||
+    msg.includes('socket hang up') ||
+    msg.includes('timeout') ||
+    msg.includes('timed out') ||
+    msg.includes('tunneling') ||
+    msg.includes('proxy connection') ||
+    msg.includes('network socket')
+  );
+}

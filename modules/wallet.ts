@@ -14,6 +14,7 @@ import { Keypair } from '@solana/web3.js';
 import CryptoJS from 'crypto-js';
 
 import { ENCRYPTION_PASSWORD } from '../global.js';
+import { checkProxyHealth } from './phoenix-api.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, '..');
@@ -155,15 +156,58 @@ export function readProxies(): string[] {
   return proxies;
 }
 
+// ==================== PROXY HEALTH ====================
+
+/** Mask proxy credentials for logging */
+function maskProxy(proxyUrl: string): string {
+  return proxyUrl.replace(/\/\/.*@/, '//***@');
+}
+
+/** Warn loudly when wallets have no proxy isolation at all */
+function warnNoProxies(): void {
+  console.log('\n⚠️⚠️⚠️  NO usable proxies — ALL wallets will run from ONE IP!');
+  console.log('   The exchange can trivially link them together.');
+  console.log('   Add proxies to input_data/proxies.txt to isolate wallets.\n');
+}
+
+/**
+ * Check liveness of proxies via an IP echo service.
+ * Returns only alive proxies (in original order, without duplicates).
+ */
+export async function checkProxiesHealth(proxyUrls: string[]): Promise<string[]> {
+  const unique = [...new Set(proxyUrls)];
+  const alive: string[] = [];
+
+  console.log(`🌐 Checking ${unique.length} proxy(ies)...`);
+  const results = await Promise.all(unique.map((url) => checkProxyHealth(url)));
+
+  results.forEach((ip, i) => {
+    const url = unique[i]!;
+    if (ip) {
+      alive.push(url);
+      console.log(`   ✅ ${maskProxy(url)} → ${ip}`);
+    } else {
+      console.log(`   ⚠️ ${maskProxy(url)} → dead/unreachable`);
+    }
+  });
+
+  return alive;
+}
+
 // ==================== WALLET LOADING ====================
 
 /**
  * Load wallets from privatekeys.txt, assign proxies round-robin.
+ * Dead proxies are excluded before assignment.
  * Returns array of WalletAccount with keypairs ready to use.
  */
-export function loadWallets(): WalletAccount[] {
+export async function loadWallets(): Promise<WalletAccount[]> {
   const keys = readPrivateKeys();
-  const proxies = readProxies();
+  const proxies = await checkProxiesHealth(readProxies());
+
+  if (proxies.length === 0) {
+    warnNoProxies();
+  }
 
   const wallets: WalletAccount[] = keys.map((key, index) => {
     const keypair = createKeypair(key);
@@ -179,11 +223,38 @@ export function loadWallets(): WalletAccount[] {
 
   console.log(`✅ Created ${wallets.length} wallet(s):`);
   for (const w of wallets) {
-    const proxy = w.proxyUrl ? ` | proxy: ${w.proxyUrl.slice(0, 30)}...` : ' | no proxy';
+    const proxy = w.proxyUrl ? ` | proxy: ${maskProxy(w.proxyUrl)}` : ' | no proxy';
     console.log(`   [${w.index}] ${w.address.slice(0, 8)}...${w.address.slice(-6)}${proxy}`);
   }
 
   return wallets;
+}
+
+/**
+ * Health-check the proxies already assigned to wallets (encrypted-storage path).
+ * Only warns — never reassigns persisted wallet→proxy bindings.
+ */
+export async function checkAssignedProxiesHealth(wallets: WalletAccount[]): Promise<void> {
+  const assigned = wallets.map((w) => w.proxyUrl).filter((u): u is string => !!u);
+
+  if (assigned.length === 0) {
+    warnNoProxies();
+    return;
+  }
+
+  const unique = [...new Set(assigned)];
+  console.log(`🌐 Checking ${unique.length} assigned proxy(ies)...`);
+  const results = await Promise.all(unique.map((url) => checkProxyHealth(url)));
+
+  results.forEach((ip, i) => {
+    const url = unique[i]!;
+    if (ip) {
+      console.log(`   ✅ ${maskProxy(url)} → ${ip}`);
+    } else {
+      const users = wallets.filter((w) => w.proxyUrl === url).length;
+      console.log(`   ⚠️ ${maskProxy(url)} → dead/unreachable (${users} wallet(s) affected!)`);
+    }
+  });
 }
 
 // ==================== ENCRYPTED STORAGE ====================
@@ -233,7 +304,6 @@ export function loadEncryptedWallets(): WalletAccount[] | null {
       };
     });
 
-    console.log(`🔓 Loaded ${wallets.length} wallet(s) from encrypted storage`);
     return wallets;
   } catch (e: any) {
     console.log(`⚠️ Failed to load encrypted wallets: ${e.message}`);

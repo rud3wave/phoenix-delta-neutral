@@ -16,9 +16,11 @@ import { sendTg } from './modules/telegram.js';
 import {
   loadWallets,
   readPrivateKeys,
+  readProxies,
   saveEncryptedWallets,
   loadEncryptedWallets,
   createKeypair,
+  checkAssignedProxiesHealth,
   type WalletAccount,
 } from './modules/wallet.js';
 import { sleep, shuffleArray, shortAddr } from './modules/utils.js';
@@ -71,6 +73,7 @@ async function initWallets(): Promise<WalletAccount[]> {
 
     if (match) {
       console.log(`🔓 Loaded ${encrypted.length} wallet(s) from encrypted storage`);
+      await checkAssignedProxiesHealth(encrypted);
       return encrypted;
     }
 
@@ -80,7 +83,7 @@ async function initWallets(): Promise<WalletAccount[]> {
   }
 
   // Load from txt and encrypt
-  const wallets = loadWallets();
+  const wallets = await loadWallets();
   saveEncryptedWallets(rawKeys, wallets);
 
   return wallets;
@@ -119,6 +122,7 @@ async function runDeltaNeutral(services: PhoenixService[]): Promise<void> {
   console.log('\n🚀 Starting delta-neutral trading...');
 
   const controller = new DeltaNeutralController();
+  controller.setProxyPool(readProxies());
 
   // Register all services with their balances
   for (const service of services) {

@@ -123,7 +123,7 @@ function generateHeaders(): Record<string, string> {
     'accept-language': generateAcceptLanguage(),
     'content-type': 'application/json',
     'sec-ch-ua-mobile': '?0',
-    'sec-ch-ua-platform': `\\"${platform}\\"`,
+    'sec-ch-ua-platform': `"${platform}"`,
     'sec-fetch-site': 'same-origin',
     'sec-fetch-dest': 'empty',
     'sec-fetch-mode': 'cors',
@@ -133,6 +133,27 @@ function generateHeaders(): Record<string, string> {
     Origin: PHOENIX_SITE_URL,
     Referer: `${PHOENIX_SITE_URL}/`,
   };
+}
+
+// ==================== PROXY HEALTH CHECK ====================
+
+/**
+ * Check if a proxy is alive by requesting an IP echo service through it.
+ * Returns the proxy's public IP, or null if the proxy is dead/slow.
+ */
+export async function checkProxyHealth(proxyUrl: string, timeoutMs = 10_000): Promise<string | null> {
+  try {
+    const res = await gotScraping.get('https://api.myip.com', {
+      proxyUrl,
+      timeout: { request: timeoutMs },
+      retry: { limit: 0 },
+      headers: { accept: 'application/json' },
+    });
+    const body = JSON.parse(res.body) as { ip?: string };
+    return body.ip ?? null;
+  } catch {
+    return null;
+  }
 }
 
 // ==================== TYPES ====================

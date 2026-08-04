@@ -158,11 +158,11 @@ export interface PlacePositionOrderParams {
 // ==================== SERVICE ====================
 
 export class PhoenixService {
-  private readonly apiClient: PhoenixApiClient;
-  private readonly connection: Connection;
+  private apiClient: PhoenixApiClient;
+  private connection: Connection;
   private readonly wallet: Keypair;
   private readonly walletAddress: string;
-  private readonly proxyUrl?: string;
+  private proxyUrl?: string;
   private baseLotsDecimalsCache: Record<string, number> = {};
   private traderPda: string = '';
 
@@ -170,7 +170,10 @@ export class PhoenixService {
     this.wallet = wallet;
     this.walletAddress = wallet.publicKey.toString();
     this.proxyUrl = proxyUrl;
-    this.connection = new Connection(SOLANA_RPC, 'confirmed');
+    this.connection = new Connection(SOLANA_RPC, {
+      commitment: 'confirmed',
+      fetch: createProxyFetch(proxyUrl),
+    });
     this.apiClient = new PhoenixApiClient({ proxyUrl });
   }
 
@@ -184,6 +187,27 @@ export class PhoenixService {
 
   public getTraderPda(): string {
     return this.traderPda;
+  }
+
+  public getProxyUrl(): string | undefined {
+    return this.proxyUrl;
+  }
+
+  /**
+   * Switch this wallet to a different proxy at runtime.
+   * Rebuilds API client + RPC connection and re-authenticates through the new proxy.
+   */
+  public async rotateProxy(newProxyUrl: string): Promise<void> {
+    const masked = newProxyUrl.replace(/\/\/.*@/, '//***@');
+    console.log(`  🔄 [${this.walletAddress.slice(0, 6)}] Rotating proxy → ${masked}`);
+
+    this.proxyUrl = newProxyUrl;
+    this.connection = new Connection(SOLANA_RPC, {
+      commitment: 'confirmed',
+      fetch: createProxyFetch(newProxyUrl),
+    });
+    this.apiClient = new PhoenixApiClient({ proxyUrl: newProxyUrl });
+    await this.loginHandler();
   }
 
   // ==================== AUTH ====================

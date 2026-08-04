@@ -31,7 +31,11 @@ import {
   isRangeEmpty,
   shuffleArray,
   shortAddr,
+  isNetworkError,
 } from './utils.js';
+
+// Max proxy rotations per wallet before failures start counting
+const MAX_PROXY_ROTATIONS = 2;
 
 // ==================== TYPES ====================
 
@@ -45,6 +49,7 @@ interface GroupAccount {
   orderAmount?: number;
   leverage?: number;
   failures: number;
+  proxyRotations: number;
   tradesCompleted: number;
   targetTrades: number;
 }
@@ -60,8 +65,14 @@ interface ActiveGroup {
 
 export class DeltaNeutralController {
   private pool: GroupAccount[] = [];
+  private proxyPool: string[] = [];
   private isRunning = false;
   private nextGroupId = 1;
+
+  /** Provide the full proxy pool for runtime rotation on network errors */
+  public setProxyPool(proxies: string[]): void {
+    this.proxyPool = [...new Set(proxies)];
+  }
 
   /** Register a wallet into the pool */
   public register(service: PhoenixService, balance: number): void {
@@ -72,11 +83,39 @@ export class DeltaNeutralController {
       balanceBefore: balance,
       balanceAfter: 0,
       failures: 0,
+      proxyRotations: 0,
       tradesCompleted: 0,
       targetTrades: TRADES_COUNT,
     };
     this.pool.push(account);
     console.log(`  📥 Registered ${shortAddr(account.address)} | Balance: $${balance.toFixed(2)} | Target trades: ${account.targetTrades}`);
+  }
+
+  /**
+   * Handle an account failure.
+   * Network-level errors rotate the proxy (up to MAX_PROXY_ROTATIONS) instead
+   * of counting a failure; anything else increments the failure counter.
+   */
+  private async handleFailure(acc: GroupAccount, e: any): Promise<void> {
+    if (
+      isNetworkError(e) &&
+      acc.proxyRotations < MAX_PROXY_ROTATIONS &&
+      this.proxyPool.length > 1
+    ) {
+      const current = acc.service.getProxyUrl();
+      const candidates = this.proxyPool.filter((p) => p !== current);
+      if (candidates.length > 0) {
+        const next = candidates[Math.floor(Math.random() * candidates.length)]!;
+        acc.proxyRotations++;
+        try {
+          await acc.service.rotateProxy(next);
+          return; // rotated successfully — don't count the failure
+        } catch (rotateErr: any) {
+          console.log(`  ⚠️ Proxy rotation failed for ${shortAddr(acc.address)}: ${rotateErr.message}`);
+        }
+      }
+    }
+    acc.failures++;
   }
 
   /** Main loop — form groups and execute strategy */
@@ -296,7 +335,7 @@ export class DeltaNeutralController {
       console.log('  ✅ Emergency cleanup complete (maker)');
 
       for (const acc of accounts) {
-        acc.failures++;
+        await this.handleFailure(acc, e);
       }
     }
   }
@@ -613,7 +652,7 @@ export class DeltaNeutralController {
         console.log(`  ✅ ${shortAddr(acc.address)} MARKET open filled`);
       } catch (e: any) {
         console.log(`  ❌ MARKET open failed for ${shortAddr(acc.address)}: ${e.message}`);
-        acc.failures++;
+        await this.handleFailure(acc, e);
       }
     }));
   }
@@ -641,7 +680,7 @@ export class DeltaNeutralController {
         });
       } catch (e: any) {
         console.log(`  ❌ LIMIT open failed for ${shortAddr(acc.address)}: ${e.message}`);
-        acc.failures++;
+        await this.handleFailure(acc, e);
       }
     }));
 
@@ -738,7 +777,7 @@ export class DeltaNeutralController {
         console.log(`  ✅ ${shortAddr(acc.address)} follower MARKET filled`);
       } catch (e: any) {
         console.log(`  ❌ MARKET order failed for ${shortAddr(acc.address)}: ${e.message}`);
-        acc.failures++;
+        await this.handleFailure(acc, e);
       }
     }));
   }

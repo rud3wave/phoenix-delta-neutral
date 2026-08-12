@@ -6,6 +6,10 @@
 import {
   createPhoenixClient,
   Side,
+  OrderFlags,
+  baseUnitsToBaseLotsWithMarketParams,
+  priceUsdToTicksWithMarketParams,
+  type PostOnlyOrderPacket,
   buildAcceptEscrowRequestIx,
   getPhoenixEscrowAddress,
   getPhoenixTraderSubaccountAddress,
@@ -47,6 +51,7 @@ import {
   type SolanaInstruction,
   type TraderStateResponse,
 } from './phoenix-api.js';
+import { SLIPPAGE } from '../settings.js';
 
 // ==================== CONFIG ====================
 
@@ -147,10 +152,12 @@ export interface PositionWithLiquidation {
 export interface PlacePositionOrderParams {
   instrument: string;
   executionSide: 'long' | 'short';
-  executionType: 'market' | 'limit';
+  executionType: 'market' | 'limit' | 'post-only';
   amountUsd: number;
   leverage?: number;
   overrideBaseUnits?: number;
+  reduceOnly?: boolean;
+  maxSlippagePercent?: number;
   takeProfitPricePercent?: number;
   stopLossPricePercent?: number;
 }
@@ -165,6 +172,7 @@ export class PhoenixService {
   private proxyUrl?: string;
   private baseLotsDecimalsCache: Record<string, number> = {};
   private traderPda: string = '';
+  private orderClient: ReturnType<typeof createPhoenixClient> | null = null;
 
   constructor(wallet: Keypair, proxyUrl?: string) {
     this.wallet = wallet;
@@ -175,6 +183,24 @@ export class PhoenixService {
       fetch: createProxyFetch(proxyUrl),
     });
     this.apiClient = new PhoenixApiClient({ proxyUrl });
+  }
+
+  private async getOrderClient(): Promise<ReturnType<typeof createPhoenixClient>> {
+    if (!this.orderClient) {
+      this.orderClient = createPhoenixClient({
+        apiUrl: PHOENIX_API_URL,
+        rpcUrl: this.connection.rpcEndpoint,
+        auth: false,
+        ws: false,
+        exchangeMetadata: { stream: false },
+      });
+    }
+    await this.orderClient.exchange.ready();
+    return this.orderClient;
+  }
+
+  public async warmOrderClient(): Promise<void> {
+    await this.getOrderClient();
   }
 
   public getAddress(): string {
@@ -202,6 +228,8 @@ export class PhoenixService {
     console.log(`  🔄 [${this.walletAddress.slice(0, 6)}] Rotating proxy → ${masked}`);
 
     this.proxyUrl = newProxyUrl;
+    this.orderClient?.dispose();
+    this.orderClient = null;
     this.connection = new Connection(SOLANA_RPC, {
       commitment: 'confirmed',
       fetch: createProxyFetch(newProxyUrl),
@@ -477,29 +505,20 @@ export class PhoenixService {
       return this.baseLotsDecimalsCache[symbol]!;
     }
 
-    try {
-      const client = createPhoenixClient({
-        apiUrl: PHOENIX_API_URL,
-        rpcUrl: this.connection.rpcEndpoint,
-        auth: false,
-        ws: false,
-        exchangeMetadata: { stream: false },
-      });
-      const snapshot = await client.exchange.ready();
-
-      const market = snapshot.markets.find(
-        (m: any) =>
-          m.symbol.toUpperCase() === symbol.toUpperCase() ||
-          m.symbol.toUpperCase() === `${symbol.toUpperCase()}-PERP`
-      );
-
-      const decimals = market?.baseLotsDecimals ?? 0;
-      this.baseLotsDecimalsCache[symbol] = decimals;
-      client.dispose();
-      return decimals;
-    } catch {
-      return 0;
+    const client = await this.getOrderClient();
+    const snapshot = client.exchange.snapshot();
+    const market = snapshot.markets.find(
+      (m: any) =>
+        m.symbol.toUpperCase() === symbol.toUpperCase() ||
+        m.symbol.toUpperCase() === `${symbol.toUpperCase()}-PERP`
+    );
+    if (!market || !Number.isInteger(market.baseLotsDecimals)) {
+      throw new Error(`Missing base lot metadata for ${symbol}`);
     }
+
+    const decimals = market.baseLotsDecimals;
+    this.baseLotsDecimalsCache[symbol] = decimals;
+    return decimals;
   }
 
   // Convert lots to base units
@@ -517,6 +536,21 @@ export class PhoenixService {
     await this.getBaseLotsDecimals(symbol);
     const rawLots = Math.abs(Number(position.basePositionLots));
     return this.lotsToBaseUnits(rawLots, symbol);
+  }
+
+  public async getSignedPositionBaseUnits(symbol: string): Promise<number> {
+    const state = await this.getPositions();
+    const position = this.findPosition(state, symbol);
+    if (!position) return 0;
+
+    await this.getBaseLotsDecimals(symbol);
+    return this.lotsToBaseUnits(Number(position.basePositionLots), symbol);
+  }
+
+  public async quantizeBaseUnits(symbol: string, baseUnits: number): Promise<number> {
+    const decimals = await this.getBaseLotsDecimals(symbol);
+    const scale = Math.pow(10, decimals);
+    return Math.floor((Math.max(0, baseUnits) + Number.EPSILON) * scale) / scale;
   }
 
   // ==================== CLOSE POSITIONS ====================
@@ -588,31 +622,26 @@ export class PhoenixService {
   // ==================== CANCEL ORDERS ====================
 
   // Cancel ALL limit orders via Rise SDK (on-chain)
-  public async cancelAllOrders(symbol: string): Promise<void> {
-    let client: any;
-
+  public async cancelAllOrders(symbol: string, strict = false, force = false): Promise<void> {
     try {
-      client = createPhoenixClient({
-        apiUrl: PHOENIX_API_URL,
-        auth: false,
-        ws: false,
-      });
-
-      await client.exchange.ready();
+      const client = await this.getOrderClient();
 
       // Cancel only for subaccounts that API actually sees with orders
       const state = await this.apiClient.getTraderState(this.walletAddress);
       const subaccounts = state.snapshot?.subaccounts ?? [];
-      const subaccountIndices: number[] = [0];
+      const subaccountIndices: number[] = force ? [0] : [];
 
       for (const sub of subaccounts) {
-        const hasOrders = (sub.orders ?? []).some((g) =>
-          (g.orders ?? []).some((o) => o.status === 'open' || o.status === 'active')
+        const hasOrders = (sub.orders ?? []).some((group) =>
+          group.symbol.toUpperCase() === symbol.toUpperCase() &&
+          (group.orders ?? []).some((order) => order.status === 'open' || order.status === 'active')
         );
         if (hasOrders && !subaccountIndices.includes(sub.subaccountIndex)) {
           subaccountIndices.push(sub.subaccountIndex);
         }
       }
+
+      if (subaccountIndices.length === 0) return;
 
       for (const subIdx of subaccountIndices) {
         try {
@@ -658,12 +687,12 @@ export class PhoenixService {
           console.log(`  ✅ Cancelled orders subaccount[${subIdx}] ${symbol} | tx: ${txHash}`);
         } catch (e) {
           console.log(`  ℹ️ Cancel subaccount[${subIdx}] ${symbol}: skipped (${e})`);
+          if (strict) throw e;
         }
       }
     } catch (e) {
       console.log(`  ⚠️ Failed to cancel orders via SDK: ${e}`);
-    } finally {
-      client?.dispose();
+      if (strict) throw e;
     }
   }
 
@@ -688,9 +717,10 @@ export class PhoenixService {
     await this.placePositionOrder({
       instrument: symbol,
       executionSide: closeSide as 'long' | 'short',
-      executionType: 'limit',
+      executionType: 'post-only',
       amountUsd: 0,
       overrideBaseUnits: baseUnits,
+      reduceOnly: true,
     });
   }
 
@@ -715,6 +745,7 @@ export class PhoenixService {
       executionType: 'market',
       amountUsd: 0,
       overrideBaseUnits: baseUnits,
+      reduceOnly: true,
     });
   }
 
@@ -824,8 +855,18 @@ export class PhoenixService {
 
   // ==================== TRADING (Rise SDK) ====================
 
-  public async placePositionOrder(params: PlacePositionOrderParams): Promise<{ rfqId: string }> {
-    const { instrument, executionSide, executionType, amountUsd, overrideBaseUnits } = params;
+  public async placePositionOrder(
+    params: PlacePositionOrderParams
+  ): Promise<{ rfqId: string; orderPrice?: number; makerReferencePrice?: number }> {
+    const {
+      instrument,
+      executionSide,
+      executionType,
+      amountUsd,
+      overrideBaseUnits,
+      reduceOnly = false,
+      maxSlippagePercent = SLIPPAGE,
+    } = params;
 
     // Check token validity before API calls — if expired, re-login
     try {
@@ -844,15 +885,7 @@ export class PhoenixService {
 
     const quantity = overrideBaseUnits ?? amountUsd / midPrice;
 
-    // Use Rise SDK for building instructions — it correctly handles margin mode
-    const client = createPhoenixClient({
-      apiUrl: PHOENIX_API_URL,
-      rpcUrl: this.connection.rpcEndpoint,
-      auth: false,
-      ws: false,
-      exchangeMetadata: { stream: false },
-    });
-    await client.exchange.ready();
+    const client = await this.getOrderClient();
 
     const sdkSide = executionSide === 'long' ? Side.Bid : Side.Ask;
 
@@ -865,13 +898,23 @@ export class PhoenixService {
       instrument;
 
     let rawIxs: any[];
+    let orderPrice: number | undefined;
+    let makerReferencePrice: number | undefined;
 
-    try {
-      if (executionType === 'market') {
+    if (executionType === 'market') {
+        const bestBid = orderbook.bids[0]?.[0] ?? midPrice;
+        const bestAsk = orderbook.asks[0]?.[0] ?? midPrice;
+        const slippageFraction = Math.max(0, maxSlippagePercent) / 100;
+        const priceLimitUsd = executionSide === 'long'
+          ? bestAsk * (1 + slippageFraction)
+          : bestBid * (1 - slippageFraction);
         const orderPacket = await client.orderPackets.buildMarketOrderPacket({
           symbol: marketSymbol as any,
           side: sdkSide,
           baseUnits: quantity.toString(),
+          minBaseUnitsToFill: quantity.toString(),
+          priceLimitUsd: priceLimitUsd.toString(),
+          orderFlags: reduceOnly ? OrderFlags.ReduceOnly : OrderFlags.None,
         });
 
         const ix = await client.ixs.buildPlaceMarketOrder({
@@ -882,13 +925,19 @@ export class PhoenixService {
         });
 
         rawIxs = Array.isArray(ix) ? ix : [ix];
-      } else {
+    } else {
         const bestBid = orderbook.bids[0]?.[0] ?? midPrice;
         const bestAsk = orderbook.asks[0]?.[0] ?? midPrice;
-        // Same-side placement = MAKER fee.
-        // Sell limit at bestAsk → rests on ask side, fills when market buyer hits it.
-        // Buy limit at bestBid → rests on bid side, fills when market seller hits it.
-        const limitPrice = executionSide === 'long' ? bestBid : bestAsk;
+        const market = client.exchange.market(marketSymbol as any);
+        if (!market) throw new Error(`Missing market metadata for ${marketSymbol}`);
+        const tickSize = Number(market.tickSize);
+        const canImprove = Number.isFinite(tickSize) && tickSize > 0 && bestAsk - bestBid > tickSize;
+        const limitPrice = Number((executionSide === 'long'
+          ? (canImprove ? bestAsk - tickSize : bestBid)
+          : (canImprove ? bestBid + tickSize : bestAsk)
+        ).toFixed(10));
+        orderPrice = limitPrice;
+        makerReferencePrice = executionSide === 'long' ? bestAsk : bestBid;
 
         console.log(
           `  📋 Limit ${executionSide.toUpperCase()} @ ${limitPrice} (mid: ${midPrice}, spread: ${(
@@ -897,24 +946,46 @@ export class PhoenixService {
           ).toFixed(4)}%)`
         );
 
-        const orderPacket = await client.orderPackets.buildLimitOrderPacket({
-          symbol: marketSymbol as any,
-          side: sdkSide,
-          priceUsd: limitPrice.toString(),
-          baseUnits: quantity.toString(),
-        });
-
-        const ix = await client.ixs.buildPlaceLimitOrder({
-          authority: this.walletAddress as any,
-          symbol: marketSymbol as any,
-          orderPacket,
-          traderPdaIndex: 0,
-        });
+        let ix: any;
+        if (executionType === 'post-only') {
+          const orderPacket: PostOnlyOrderPacket = {
+            side: sdkSide,
+            priceInTicks: priceUsdToTicksWithMarketParams(limitPrice.toString(), {
+              tickSize: market.tickSize,
+              baseLotsDecimals: market.baseLotsDecimals,
+            }),
+            numBaseLots: baseUnitsToBaseLotsWithMarketParams(quantity.toString(), {
+              baseLotsDecimals: market.baseLotsDecimals,
+            }),
+            clientOrderId: (BigInt(Date.now()) << 16n) + BigInt(Math.floor(Math.random() * 65536)),
+            slide: true,
+            lastValidSlot: null,
+            orderFlags: reduceOnly ? OrderFlags.ReduceOnly : OrderFlags.None,
+            cancelExisting: false,
+          };
+          ix = await client.ixs.buildPlacePostOnlyOrder({
+            authority: this.walletAddress as any,
+            symbol: marketSymbol as any,
+            orderPacket,
+            traderPdaIndex: 0,
+          });
+        } else {
+          const orderPacket = await client.orderPackets.buildLimitOrderPacket({
+            symbol: marketSymbol as any,
+            side: sdkSide,
+            priceUsd: limitPrice.toString(),
+            baseUnits: quantity.toString(),
+            orderFlags: reduceOnly ? OrderFlags.ReduceOnly : OrderFlags.None,
+          });
+          ix = await client.ixs.buildPlaceLimitOrder({
+            authority: this.walletAddress as any,
+            symbol: marketSymbol as any,
+            orderPacket,
+            traderPdaIndex: 0,
+          });
+        }
 
         rawIxs = Array.isArray(ix) ? ix : [ix];
-      }
-    } finally {
-      client.dispose();
     }
 
     // Convert from @solana/kit format to legacy TransactionInstruction
@@ -932,9 +1003,6 @@ export class PhoenixService {
     if (ixs.length === 0) {
       throw new Error('No instructions returned from SDK');
     }
-
-    // Delay before sending to avoid rate limiting and nonce conflicts
-    await sleep(2 + Math.random() * 1);
 
     const { blockhash } = await this.connection.getLatestBlockhash('confirmed');
 
@@ -958,7 +1026,7 @@ export class PhoenixService {
       `  ✅ Order placed: ${executionSide.toUpperCase()} ${instrument} | $${amountUsd.toFixed(2)} | tx: ${txHash}`
     );
 
-    return { rfqId: txHash };
+    return { rfqId: txHash, orderPrice, makerReferencePrice };
   }
 
   // ==================== REWARDS CLAIM ====================

@@ -50,9 +50,6 @@ export const GROUP_CONFIGS = [[3, 2]];
 // Если спред выше — бот ждёт пока сузится
 export const MAX_SPREAD = 0.03;
 
-// Задержка после заполнения лимитки лидера (секунды) 
-export const DELAY_AFTER_LEADER_FILL = [0, 1];
-
 // --- УДЕРЖАНИЕ ---
 
 // Время удержания позиций перед закрытием (минуты) 
@@ -75,3 +72,14 @@ export const POLL_INTERVAL_SEC = 5;
 
 // --- ПРОСКАЛЬЗЫВАНИЕ ---
 export const SLIPPAGE = 0.02;
+
+// --- ПАРНОЕ ИСПОЛНЕНИЕ ---
+// Частичный maker-fill сразу хеджируется второй ногой. Значения ниже заданы
+// консервативно: они ограничивают время открытой дельты, не превращая RPC в спам.
+export const HEDGE_POLL_INTERVAL_MS = 300;
+// Проверяем необходимость requote редко и двигаем ордер только когда BBO ушёл
+// достаточно далеко. Это не таймер обязательной отмены.
+export const MAKER_REQUOTE_INTERVAL_SEC = 20;
+export const MAKER_REQUOTE_THRESHOLD_PERCENT = 0.03;
+export const MAX_MAKER_WAIT_SEC = 180;
+export const MAX_HEDGE_RETRIES = 3;

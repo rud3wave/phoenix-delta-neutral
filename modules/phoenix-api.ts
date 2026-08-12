@@ -264,6 +264,45 @@ export interface TraderStateResponse {
   snapshot: TraderStateSnapshot;
 }
 
+export interface TraderFillRecord {
+  marketSymbol: string;
+  signature: string | null;
+  fillId: string | null;
+  timestamp: string | number;
+  baseLotsBefore: string;
+  baseLotsAfter: string;
+  baseLotsDelta: string;
+  price: string;
+  realizedPnl: string;
+  fees: string;
+  liquidity: 'maker' | 'taker';
+  tradeType: 'limit' | 'market' | 'liquidation' | 'adl';
+  instructionType: string;
+}
+
+export interface TraderFillsResponse {
+  data: TraderFillRecord[];
+  prevCursor?: string | null;
+  nextCursor: string | null;
+  hasMore: boolean;
+}
+
+export interface TraderFundingEvent {
+  timestamp: string | number;
+  symbol: string;
+  fundingPayment: string;
+  fundingRatePercentage: string;
+  positionSize: string;
+  positionSide: string;
+}
+
+export interface TraderFundingResponse {
+  events: TraderFundingEvent[];
+  prevCursor?: string | null;
+  nextCursor: string | null;
+  hasMore: boolean;
+}
+
 // --- ORDERS ---
 
 export interface SolanaAccountMeta {
@@ -555,6 +594,34 @@ export class PhoenixApiClient {
   public async getTraderCapabilities(): Promise<unknown> {
     const res = await this.session.get(`${PHOENIX_API_URL}/v1/view/trader-capabilities`);
     return this.extractBody<unknown>(res);
+  }
+
+  public async getTraderTradesHistory(
+    authorityPubkey: string,
+    params: { marketSymbol?: string; limit?: number; cursor?: string } = {}
+  ): Promise<TraderFillsResponse> {
+    const res = await this.session.get(
+      `${PHOENIX_API_URL}/v1/trader/${encodeURIComponent(authorityPubkey)}/trades-history`,
+      { searchParams: params }
+    );
+    return this.extractBody<TraderFillsResponse>(res);
+  }
+
+  public async getTraderFundingHistory(
+    authorityPubkey: string,
+    params: {
+      symbol?: string;
+      startTime?: number;
+      endTime?: number;
+      limit?: number;
+      cursor?: string;
+    } = {}
+  ): Promise<TraderFundingResponse> {
+    const res = await this.session.get(
+      `${PHOENIX_API_URL}/v1/trader/${encodeURIComponent(authorityPubkey)}/funding-history`,
+      { searchParams: params }
+    );
+    return this.extractBody<TraderFundingResponse>(res);
   }
 
   // ==================== ORDERS ====================

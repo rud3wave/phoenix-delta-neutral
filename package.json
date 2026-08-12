@@ -9,7 +9,8 @@
   "scripts": {
     "start": "node --import tsx main.ts",
     "build": "tsc",
-    "dev": "tsx main.ts"
+    "dev": "tsx main.ts",
+    "test": "node --import tsx --test tests/**/*.test.ts"
   },
   "dependencies": {
     "@ellipsis-labs/rise": "^0.4.66",

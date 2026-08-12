@@ -8,3 +8,6 @@ global.js
 tmp-*
 .playwright-mcp/
 debug-*.log
+dist/
+.phoenix-trading.lock
+.phoenix-halt

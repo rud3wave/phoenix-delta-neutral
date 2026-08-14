@@ -176,17 +176,17 @@ export function formatCycleMetrics(metrics: CycleMetrics): string[] {
     ? (-metrics.netPnl / metrics.actualVolume) * 100_000
     : 0;
 
-  return [
-    `📐 Gross realized PnL: ${formatSignedUsd(metrics.grossRealizedPnl)}`,
-    `↔️ LONG/SHORT price gap: ${formatSignedUsd(metrics.totalPriceGapPnl)}`,
-    `  Open gap: ${formatSignedUsd(metrics.openPriceGapPnl)}`,
-    `  Close gap: ${formatSignedUsd(metrics.closePriceGapPnl)}`,
-    `💸 Opening fees: -${metrics.openingFees.toFixed(4)}$`,
-    `💸 Closing fees: -${metrics.closingFees.toFixed(4)}$`,
-    `💸 Total fees: -${metrics.totalFees.toFixed(4)}$`,
-    `⏱ Funding: ${formatSignedUsd(metrics.funding)}`,
+  const lines = [
     `📊 Full-cycle PnL: ${formatSignedUsd(metrics.netPnl)}`,
-    `💰 Actual traded volume: $${metrics.actualVolume.toFixed(2)}`,
-    `Cost per 100k: ${costPer100k.toFixed(3)}$`,
+    `💸 Fees: -${metrics.totalFees.toFixed(4)}$ ` +
+      `(open -${metrics.openingFees.toFixed(4)}$ | close -${metrics.closingFees.toFixed(4)}$)`,
+    `↔️ Price gap: ${formatSignedUsd(metrics.totalPriceGapPnl)} ` +
+      `(open ${formatSignedUsd(metrics.openPriceGapPnl)} | close ${formatSignedUsd(metrics.closePriceGapPnl)})`,
+    `💰 Turnover (open + close): $${metrics.actualVolume.toFixed(2)} | ` +
+      `Cost: ${costPer100k.toFixed(3)}$ / 100k`,
   ];
+  if (Math.abs(metrics.funding) >= 0.01) {
+    lines.splice(3, 0, `⏱ Funding: ${formatSignedUsd(metrics.funding)}`);
+  }
+  return lines;
 }

@@ -180,8 +180,7 @@ export function formatCycleMetrics(metrics: CycleMetrics): string[] {
     `📊 Full-cycle PnL: ${formatSignedUsd(metrics.netPnl)}`,
     `💸 Fees: -${metrics.totalFees.toFixed(4)}$ ` +
       `(open -${metrics.openingFees.toFixed(4)}$ | close -${metrics.closingFees.toFixed(4)}$)`,
-    `↔️ Price gap: ${formatSignedUsd(metrics.totalPriceGapPnl)} ` +
-      `(open ${formatSignedUsd(metrics.openPriceGapPnl)} | close ${formatSignedUsd(metrics.closePriceGapPnl)})`,
+    `↔️ Разница цен LONG/SHORT: ${formatSignedUsd(metrics.totalPriceGapPnl)}`,
     `💰 Turnover (open + close): $${metrics.actualVolume.toFixed(2)} | ` +
       `Cost: ${costPer100k.toFixed(3)}$ / 100k`,
   ];

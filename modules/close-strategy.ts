@@ -108,6 +108,8 @@ export async function closeLeaderFollower(
       makerTargets,
       takerTargets,
       reduceOnly: true,
+      // Halt blocks new risk, but a close must be allowed to finish safely.
+      haltCheck: () => false,
     });
   } catch (error: any) {
     console.log(`  Paired close degraded to MARKET: ${error.message}`);

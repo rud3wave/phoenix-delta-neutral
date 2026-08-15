@@ -42,6 +42,20 @@ async function flattenResiduals(accounts: CloseAccount[], symbol: string): Promi
   }
 }
 
+async function assertStrictCloseComplete(accounts: CloseAccount[], symbol: string): Promise<void> {
+  const residuals = (await Promise.all(accounts.map(async (account) => ({
+    address: shortAddr(account.service.getAddress()),
+    position: await account.service.getSignedPositionBaseUnits(symbol),
+  })))).filter(({ position }) => Math.abs(position) > 1e-10);
+
+  if (residuals.length > 0) {
+    throw new Error(
+      `${symbol} strict paired close left residual positions; MARKET fallback is disabled: ` +
+      residuals.map(({ address, position }) => `${address}=${position}`).join(', ')
+    );
+  }
+}
+
 export async function closeLeaderFollower(
   limitAccounts: CloseAccount[],
   marketAccounts: CloseAccount[],
@@ -52,10 +66,13 @@ export async function closeLeaderFollower(
 
   await Promise.all(all.map((account) => account.service.cancelAllOrders(symbol, true)));
 
-  if (EXECUTION_MODE === 'all-market' || limitAccounts.length === 0 || marketAccounts.length === 0) {
+  if (EXECUTION_MODE === 'all-market') {
     console.log(`\n  Closing ${all.length} ${symbol} position(s) via MARKET...`);
     await flattenResiduals(all, symbol);
     return;
+  }
+  if (limitAccounts.length === 0 || marketAccounts.length === 0) {
+    throw new Error(`${symbol} strict paired close requires leader and follower accounts`);
   }
 
   const makerPositions = await Promise.all(limitAccounts.map(async (account) => ({
@@ -69,17 +86,17 @@ export async function closeLeaderFollower(
 
   const makerActive = makerPositions.filter(({ position }) => Math.abs(position) > 1e-10);
   const takerActive = takerPositions.filter(({ position }) => Math.abs(position) > 1e-10);
-  if (makerActive.length === 0 || takerActive.length === 0) {
-    await flattenResiduals(all, symbol);
+  if (makerActive.length === 0 && takerActive.length === 0) {
     return;
+  }
+  if (makerActive.length === 0 || takerActive.length === 0) {
+    throw new Error(`${symbol} strict paired close requires active positions on both sides`);
   }
 
   const makerSide = makerActive[0]!.position > 0 ? 'short' : 'long';
   const takerSide = takerActive[0]!.position > 0 ? 'short' : 'long';
   if (makerSide === takerSide) {
-    console.log(`  ${symbol} positions are not opposite; using reduce-only MARKET fallback`);
-    await flattenResiduals(all, symbol);
-    return;
+    throw new Error(`${symbol} strict paired close requires opposite maker and follower positions`);
   }
 
   const makerTotal = makerActive.reduce((sum, entry) => sum + Math.abs(entry.position), 0);
@@ -99,22 +116,17 @@ export async function closeLeaderFollower(
     ),
   ]);
 
-  try {
-    console.log(`\n  Closing ${symbol} with partial-fill maker/taker hedging...`);
-    await executePaired({
-      symbol,
-      makerSide,
-      takerSide,
-      makerTargets,
-      takerTargets,
-      reduceOnly: true,
-      // Halt blocks new risk, but a close must be allowed to finish safely.
-      haltCheck: () => false,
-    });
-  } catch (error: any) {
-    console.log(`  Paired close degraded to MARKET: ${error.message}`);
-  } finally {
-    // Handles lot rounding, unequal legacy positions, timeout and rejected FOKs.
-    await flattenResiduals(all, symbol);
-  }
+  console.log(`\n  Closing ${symbol} strictly via leader LIMIT -> follower MARKET...`);
+  await executePaired({
+    symbol,
+    makerSide,
+    takerSide,
+    makerTargets,
+    takerTargets,
+    reduceOnly: true,
+    // Force Close blocks new risk, but this close must keep working until the maker fills.
+    haltCheck: () => false,
+    maxMakerWaitSec: null,
+  });
+  await assertStrictCloseComplete(all, symbol);
 }

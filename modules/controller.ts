@@ -282,16 +282,16 @@ export class DeltaNeutralController {
       console.log(`\n  ✅ Group ${group.id} cycle completed`);
     } catch (e: any) {
       console.log(`\n  ❌ Strategy failed: ${e.message}`);
-      console.log('  🚨 Emergency cleanup via reduce-only MARKET...');
+      console.log('  Attempting strict leader/follower cleanup...');
       try {
         await closeLeaderFollower(
           accounts.filter((acc) => acc.side === 'long'),
           accounts.filter((acc) => acc.side === 'short'),
           srcToken
         );
-        console.log('  ✅ Emergency cleanup complete');
+        console.log('  ✅ Strict cleanup complete');
       } catch (cleanupError: any) {
-        console.log(`  ❌ Emergency cleanup incomplete: ${cleanupError.message}`);
+        console.log(`  ❌ Strict cleanup incomplete: ${cleanupError.message}`);
       }
 
       for (const acc of accounts) {

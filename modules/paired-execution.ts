@@ -24,6 +24,7 @@ export interface PairedExecutionParams {
   takerTargets: PairedAccountTarget[];
   reduceOnly?: boolean;
   haltCheck?: () => boolean;
+  maxMakerWaitSec?: number | null;
 }
 
 interface TrackedTarget extends PairedAccountTarget {
@@ -93,6 +94,7 @@ export async function executePaired(params: PairedExecutionParams): Promise<void
     takerTargets,
     reduceOnly = false,
     haltCheck = isTradingHalted,
+    maxMakerWaitSec = MAX_MAKER_WAIT_SEC,
   } = params;
   if (makerTargets.length === 0 || takerTargets.length === 0) {
     throw new Error(`Paired ${symbol} execution requires both maker and taker accounts`);
@@ -108,6 +110,9 @@ export async function executePaired(params: PairedExecutionParams): Promise<void
   const makers = await trackTargets(makerTargets, symbol);
   const takers = await trackTargets(takerTargets, symbol);
   const startedAt = Date.now();
+  const makerDeadline = maxMakerWaitSec === null
+    ? Number.POSITIVE_INFINITY
+    : startedAt + maxMakerWaitSec * 1000;
   const makerHighWater = makers.map(() => 0);
   const acknowledgedTakerProgress = takers.map(() => 0);
 
@@ -203,8 +208,8 @@ export async function executePaired(params: PairedExecutionParams): Promise<void
     let makerProgress = 0;
     while (makerProgress + EPSILON < makerTotal) {
       if (haltCheck()) throw new Error('Trading halted by Force Close');
-      if (Date.now() - startedAt > MAX_MAKER_WAIT_SEC * 1000) {
-        throw new Error(`Maker phase timed out after ${MAX_MAKER_WAIT_SEC}s`);
+      if (Date.now() > makerDeadline) {
+        throw new Error(`Maker phase timed out after ${maxMakerWaitSec}s`);
       }
 
       const progressBeforeQuote = await readMakerProgress();
@@ -251,7 +256,7 @@ export async function executePaired(params: PairedExecutionParams): Promise<void
       }
 
       const quoteCheckAt = Math.min(
-        startedAt + MAX_MAKER_WAIT_SEC * 1000,
+        makerDeadline,
         Date.now() + MAKER_REQUOTE_INTERVAL_SEC * 1000
       );
       while (Date.now() < quoteCheckAt && makerProgress + EPSILON < makerTotal) {

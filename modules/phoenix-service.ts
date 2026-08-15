@@ -930,17 +930,16 @@ export class PhoenixService {
         const bestAsk = orderbook.asks[0]?.[0] ?? midPrice;
         const market = client.exchange.market(marketSymbol as any);
         if (!market) throw new Error(`Missing market metadata for ${marketSymbol}`);
-        const tickSize = Number(market.tickSize);
-        const canImprove = Number.isFinite(tickSize) && tickSize > 0 && bestAsk - bestBid > tickSize;
-        const limitPrice = Number((executionSide === 'long'
-          ? (canImprove ? bestAsk - tickSize : bestBid)
-          : (canImprove ? bestBid + tickSize : bestAsk)
+        const limitPrice = Number((executionType === 'post-only'
+          ? (executionSide === 'long' ? bestAsk : bestBid)
+          : (executionSide === 'long' ? bestBid : bestAsk)
         ).toFixed(10));
         orderPrice = limitPrice;
         makerReferencePrice = executionSide === 'long' ? bestAsk : bestBid;
 
         console.log(
-          `  📋 Limit ${executionSide.toUpperCase()} @ ${limitPrice} (mid: ${midPrice}, spread: ${(
+          `  📋 ${executionType === 'post-only' ? 'Post-only' : 'Limit'} ` +
+          `${executionSide.toUpperCase()} @ ${limitPrice} (mid: ${midPrice}, spread: ${(
             ((bestAsk - bestBid) / bestBid) *
             100
           ).toFixed(4)}%)`

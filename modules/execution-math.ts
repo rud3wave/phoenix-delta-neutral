@@ -146,7 +146,7 @@ export function analyzeCycle(
   };
 }
 
-export function formatSignedUsd(value: number, digits = 4): string {
+export function formatSignedUsd(value: number, digits = 2): string {
   return `${value >= 0 ? '+' : ''}${value.toFixed(digits)}$`;
 }
 

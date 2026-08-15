@@ -48,6 +48,13 @@ export function shortAddr(addr: string): string {
   return `${addr.slice(0, 4)}...${addr.slice(-4)}`;
 }
 
+/** Render a compact clickable Solscan link without exposing the signature in logs. */
+export function formatTransactionLink(signature: string, hyperlinks = process.stdout.isTTY === true): string {
+  if (!hyperlinks) return 'Transaction';
+  const url = `https://solscan.io/tx/${encodeURIComponent(signature)}`;
+  return `\u001B]8;;${url}\u001B\\Transaction\u001B]8;;\u001B\\`;
+}
+
 /** Fisher-Yates shuffle (returns new array) */
 export function shuffleArray<T>(arr: T[]): T[] {
   const result = [...arr];

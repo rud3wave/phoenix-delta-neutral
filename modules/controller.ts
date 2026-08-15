@@ -447,7 +447,7 @@ export class DeltaNeutralController {
       if (this.tryCalculateAllocation(accounts, longCount, token)) {
         const longTotal = accounts.filter((a) => a.side === 'long').reduce((s, a) => s + (a.orderAmount ?? 0), 0);
         const shortTotal = accounts.filter((a) => a.side === 'short').reduce((s, a) => s + (a.orderAmount ?? 0), 0);
-        console.log(`  📐 Allocation OK (attempt ${attempt + 1}) | LONG: $${longTotal.toFixed(2)} | SHORT: $${shortTotal.toFixed(2)} | Δ: $${Math.abs(longTotal - shortTotal).toFixed(4)}`);
+        console.log(`  📐 Allocation OK (attempt ${attempt + 1}) | LONG: $${longTotal.toFixed(2)} | SHORT: $${shortTotal.toFixed(2)} | Δ: $${Math.abs(longTotal - shortTotal).toFixed(2)}`);
         return;
       }
     }
@@ -506,7 +506,7 @@ export class DeltaNeutralController {
 
       try {
         const snap = await accounts[0]!.service.getMarketSnapshot(srcToken);
-        lines.push(`📊 ${srcToken} | Spread: ${snap.spreadPercent.toFixed(4)}% | Mid: $${snap.midPrice.toFixed(2)}`);
+        lines.push(`📊 ${srcToken} | Spread: ${snap.spreadPercent.toFixed(2)}% | Mid: $${snap.midPrice.toFixed(2)}`);
       } catch {
         lines.push(srcToken);
       }
@@ -540,7 +540,7 @@ export class DeltaNeutralController {
 
     if (!isRangeEmpty(HOLD_MINUTES)) {
       const holdMinutes = getRandomNumber(HOLD_MINUTES);
-      console.log(`\n  ⏸️ Holding positions for ${holdMinutes.toFixed(1)} min (quiet hold)...`);
+      console.log(`\n  ⏸️ Holding positions for ${holdMinutes.toFixed(1)} min...`);
       const holdUntil = Date.now() + holdMinutes * 60_000;
       while (this.isRunning && Date.now() < holdUntil) {
         if (isTradingHalted()) {
@@ -595,7 +595,7 @@ export class DeltaNeutralController {
           const pnlSign = pnl >= 0 ? '+' : '';
           const pnlEmoji = pnl >= 0 ? '📈' : '📉';
           lines.push(
-            `${emoji} ${side} ${shortAddr(acc.address)} | ${pnlEmoji} PnL: ${pnlSign}${pnl.toFixed(4)}$ | ` +
+            `${emoji} ${side} ${shortAddr(acc.address)} | ${pnlEmoji} PnL: ${pnlSign}${pnl.toFixed(2)}$ | ` +
             `Bal: $${bal.toFixed(2)} | Cycle vol: $${volume.toFixed(2)}`
           );
         } catch {
@@ -609,9 +609,9 @@ export class DeltaNeutralController {
         lines.push(...formatCycleMetrics(report.metrics));
       } else {
         const costPer100k = fallbackVolume > 0 ? (-fallbackPnl / fallbackVolume) * 100_000 : 0;
-        lines.push(`📊 Full-cycle balance PnL: ${fallbackPnl >= 0 ? '+' : ''}${fallbackPnl.toFixed(4)}$`);
+        lines.push(`📊 Full-cycle balance PnL: ${fallbackPnl >= 0 ? '+' : ''}${fallbackPnl.toFixed(2)}$`);
         lines.push(`💰 Estimated cycle volume: $${fallbackVolume.toFixed(2)}`);
-        lines.push(`Cost per 100k: ${costPer100k.toFixed(3)}$`);
+        lines.push(`Cost per 100k: ${costPer100k.toFixed(2)}$`);
       }
 
       await sendTg(lines.join('\n'));

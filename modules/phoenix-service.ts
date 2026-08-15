@@ -44,7 +44,7 @@ import {
 import nacl from 'tweetnacl';
 import { gotScraping } from 'got-scraping';
 
-import { sleep } from './utils.js';
+import { formatTransactionLink, sleep } from './utils.js';
 import {
   PhoenixApiClient,
   type PendingEscrowRequest,
@@ -349,8 +349,8 @@ export class PhoenixService {
             return true;
           }
 
-          const sig = response.signature ?? 'n/a';
-          console.log(`  ✅ [${tag}] Registered via referral ${code} | status=${response.status} | tx: ${sig}`);
+          const tx = response.signature ? ` | ${formatTransactionLink(response.signature)}` : '';
+          console.log(`  ✅ [${tag}] Registered via referral ${code} | status=${response.status}${tx}`);
 
           // Phoenix broadcasts; confirm via trader state rather than public RPC alone
           await this.waitUntilTraderActive(45_000);
@@ -359,7 +359,7 @@ export class PhoenixService {
           const msg = e?.message ?? String(e);
           if (msg.includes('insufficient lamports')) {
             const match = msg.match(/need (\d+)/);
-            const needSol = match ? (parseInt(match[1]!) / 1e9).toFixed(3) : '0.04';
+            const needSol = match ? (parseInt(match[1]!) / 1e9).toFixed(2) : '0.04';
             throw new Error(`Not enough SOL (need ~${needSol} SOL). Send SOL to this wallet first.`);
           }
           // Invalid/exhausted code or transient API error — try next code
@@ -423,13 +423,13 @@ export class PhoenixService {
       });
 
       this.traderPda = result.traderPda;
-      console.log(`  ✅ [${tag}] Trader registered | tx: ${result.signature}`);
+      console.log(`  ✅ [${tag}] Trader registered | ${formatTransactionLink(result.signature)}`);
       await this.waitUntilTraderActive(45_000);
     } catch (e: any) {
       const msg = e?.message ?? String(e);
       if (msg.includes('insufficient lamports')) {
         const match = msg.match(/need (\d+)/);
-        const needSol = match ? (parseInt(match[1]!) / 1e9).toFixed(3) : '0.04';
+        const needSol = match ? (parseInt(match[1]!) / 1e9).toFixed(2) : '0.04';
         throw new Error(`Not enough SOL (need ~${needSol} SOL). Send SOL to this wallet first.`);
       }
 
@@ -601,7 +601,7 @@ export class PhoenixService {
         const baseUnits = this.lotsToBaseUnits(Math.abs(baseLots), symbol);
         const closeSide = baseLots > 0 ? 'short' : 'long'; // opposite side to close
 
-        console.log(`  🔄 Closing ${symbol} | ${closeSide.toUpperCase()} | ${parseFloat(baseUnits.toFixed(6))} ${symbol}`);
+        console.log(`  🔄 Closing ${symbol} | ${closeSide.toUpperCase()} | ${baseUnits.toFixed(2)} ${symbol}`);
 
         try {
           await this.placePositionOrder({
@@ -684,7 +684,10 @@ export class PhoenixService {
           });
 
           await this.waitForConfirmation(txHash);
-          console.log(`  ✅ Cancelled orders subaccount[${subIdx}] ${symbol} | tx: ${txHash}`);
+          console.log(
+            `  ✅ Cancelled orders subaccount[${subIdx}] ${symbol} | ` +
+            formatTransactionLink(txHash)
+          );
         } catch (e) {
           console.log(`  ℹ️ Cancel subaccount[${subIdx}] ${symbol}: skipped (${e})`);
           if (strict) throw e;
@@ -712,7 +715,7 @@ export class PhoenixService {
     const baseUnits = this.lotsToBaseUnits(Math.abs(Number(position.basePositionLots)), symbol);
     const closeSide = Number(position.basePositionLots) > 0 ? 'short' : 'long';
 
-    console.log(`  📋 Closing ${symbol} via LIMIT | ${closeSide.toUpperCase()} | ${parseFloat(baseUnits.toFixed(6))} ${symbol}`);
+    console.log(`  📋 Closing ${symbol} via LIMIT | ${closeSide.toUpperCase()} | ${baseUnits.toFixed(2)} ${symbol}`);
 
     await this.placePositionOrder({
       instrument: symbol,
@@ -737,7 +740,7 @@ export class PhoenixService {
     const baseUnits = this.lotsToBaseUnits(Math.abs(Number(position.basePositionLots)), symbol);
     const closeSide = Number(position.basePositionLots) > 0 ? 'short' : 'long';
 
-    console.log(`  🚀 Closing ${symbol} via MARKET | ${closeSide.toUpperCase()} | ${parseFloat(baseUnits.toFixed(6))} ${symbol}`);
+    console.log(`  🚀 Closing ${symbol} via MARKET | ${closeSide.toUpperCase()} | ${baseUnits.toFixed(2)} ${symbol}`);
 
     await this.placePositionOrder({
       instrument: symbol,
@@ -778,18 +781,23 @@ export class PhoenixService {
 
       if (snapshot.spreadPercent <= maxSpreadPercent) {
         console.log(
-          `  📊 Spread OK: ${snapshot.spreadPercent.toFixed(4)}% <= ${maxSpreadPercent}% | mid: ${snapshot.midPrice}`
+          `  📊 Spread OK: ${snapshot.spreadPercent.toFixed(2)}% <= ` +
+          `${maxSpreadPercent.toFixed(2)}% | mid: ${snapshot.midPrice.toFixed(2)}`
         );
         return { midPrice: snapshot.midPrice, spreadPercent: snapshot.spreadPercent };
       }
 
       if (Date.now() - startTime > timeoutSeconds * 1000) {
         throw new Error(
-          `Spread timeout: ${snapshot.spreadPercent.toFixed(4)}% > ${maxSpreadPercent}% for ${timeoutSeconds}s`
+          `Spread timeout: ${snapshot.spreadPercent.toFixed(2)}% > ` +
+          `${maxSpreadPercent.toFixed(2)}% for ${timeoutSeconds}s`
         );
       }
 
-      console.log(`  ⏳ Waiting for spread: ${snapshot.spreadPercent.toFixed(4)}% > ${maxSpreadPercent}%...`);
+      console.log(
+        `  ⏳ Waiting for spread: ${snapshot.spreadPercent.toFixed(2)}% > ` +
+        `${maxSpreadPercent.toFixed(2)}%...`
+      );
 
       await sleep(pollingSeconds);
     }
@@ -937,16 +945,17 @@ export class PhoenixService {
         orderPrice = limitPrice;
         makerReferencePrice = executionSide === 'long' ? bestAsk : bestBid;
 
-        const spreadPercent = (((bestAsk - bestBid) / bestBid) * 100).toFixed(4);
+        const spreadPercent = (((bestAsk - bestBid) / bestBid) * 100).toFixed(2);
         if (executionType === 'post-only') {
           console.log(
             `  📋 Post-only ${executionSide.toUpperCase()} at maker top ` +
-            `| BBO: ${bestBid}/${bestAsk} | slide ref: ${limitPrice} | spread: ${spreadPercent}%`
+            `| BBO: ${bestBid.toFixed(2)}/${bestAsk.toFixed(2)} | ` +
+            `slide ref: ${limitPrice.toFixed(2)} | spread: ${spreadPercent}%`
           );
         } else {
           console.log(
-            `  📋 Limit ${executionSide.toUpperCase()} @ ${limitPrice} ` +
-            `(mid: ${midPrice}, spread: ${spreadPercent}%)`
+            `  📋 Limit ${executionSide.toUpperCase()} @ ${limitPrice.toFixed(2)} ` +
+            `(mid: ${midPrice.toFixed(2)}, spread: ${spreadPercent}%)`
           );
         }
 
@@ -1026,8 +1035,10 @@ export class PhoenixService {
 
     await this.waitForConfirmation(txHash);
 
+    const amountLabel = amountUsd > 0 ? ` | $${amountUsd.toFixed(2)}` : '';
     console.log(
-      `  ✅ Order placed: ${executionSide.toUpperCase()} ${instrument} | $${amountUsd.toFixed(2)} | tx: ${txHash}`
+      `  ✅ Order placed: ${executionSide.toUpperCase()} ${instrument}${amountLabel} | ` +
+      formatTransactionLink(txHash)
     );
 
     return { rfqId: txHash, orderPrice, makerReferencePrice };
@@ -1052,11 +1063,11 @@ export class PhoenixService {
     const earnedUsd = (summary.rewardsEarnedQuoteLots ?? 0) / USDC_QUOTE_LOT_MULTIPLIER;
     const claimedUsd =
       (summary.rewardsClaimedHistory ?? []).reduce((sum, h) => sum + (h.amount || 0), 0) / USDC_QUOTE_LOT_MULTIPLIER;
-    console.log(`  🎁 [${tag}] Rewards earned: $${earnedUsd.toFixed(4)} | already claimed: $${claimedUsd.toFixed(4)}`);
+    console.log(`  🎁 [${tag}] Rewards earned: $${earnedUsd.toFixed(2)} | already claimed: $${claimedUsd.toFixed(2)}`);
 
     try {
       const campaign = await this.apiClient.getCampaignRewardsSummary(this.walletAddress, 'Flight Club');
-      console.log(`  🛩️ [${tag}] Flight Club total: $${(campaign.totalAmount / USDC_QUOTE_LOT_MULTIPLIER).toFixed(4)}`);
+      console.log(`  🛩️ [${tag}] Flight Club total: $${(campaign.totalAmount / USDC_QUOTE_LOT_MULTIPLIER).toFixed(2)}`);
     } catch { /* ignore */ }
 
     // 2. Pending escrow requests
@@ -1076,7 +1087,7 @@ export class PhoenixService {
         return sum;
       }, 0) / USDC_QUOTE_LOT_MULTIPLIER;
 
-    console.log(`  💰 [${tag}] Claimable: $${claimableUsd.toFixed(4)} across ${claimable.length} escrow request(s)`);
+    console.log(`  💰 [${tag}] Claimable: $${claimableUsd.toFixed(2)} across ${claimable.length} escrow request(s)`);
 
     // 3. Resolve a sponsored fee payer (pool first, then per-user allocator like the website)
     let feePayer: string;
@@ -1094,7 +1105,10 @@ export class PhoenixService {
     // 5. Sign + submit through the sponsorship endpoint
     const signature = await this.submitSponsoredClaim(ixs, feePayer);
 
-    console.log(`  ✅ [${this.walletAddress.slice(0, 6)}] Claimed $${claimableUsd.toFixed(2)} | tx: ${signature}`);
+    console.log(
+      `  ✅ [${this.walletAddress.slice(0, 6)}] Claimed $${claimableUsd.toFixed(2)} | ` +
+      formatTransactionLink(signature)
+    );
     return { claimed: true, amountUsd: claimableUsd, signature };
   }
 
@@ -1356,7 +1370,10 @@ export class PhoenixService {
       await this.waitForConfirmation(txHash);
 
       const depositedUsd = depositAmount / 1e6;
-      console.log(`  ✅ [${tag}] Deposited $${depositedUsd.toFixed(2)} to exchange | tx: ${txHash}`);
+      console.log(
+        `  ✅ [${tag}] Deposited $${depositedUsd.toFixed(2)} to exchange | ` +
+        formatTransactionLink(txHash)
+      );
       return { deposited: depositedUsd, txHash };
     } catch (e: any) {
       console.log(`  ⚠️ [${tag}] Deposit failed: ${e.message}`);
@@ -1467,7 +1484,7 @@ export class PhoenixService {
         withdrawnAmount += balance.amount;
         console.log(
           `  ✅ [${tag}] Withdrew $${(balance.amount / 1e6).toFixed(2)} ` +
-          `from subaccount[${balance.subaccountIndex}] | tx: ${txHash}`
+          `from subaccount[${balance.subaccountIndex}] | ${formatTransactionLink(txHash)}`
         );
       }
 

@@ -37,7 +37,7 @@ async function flattenResiduals(accounts: CloseAccount[], symbol: string): Promi
   if (stillOpen.length > 0) {
     throw new Error(
       `${symbol} residual positions remain: ` +
-      stillOpen.map(({ address, position }) => `${address}=${position}`).join(', ')
+      stillOpen.map(({ address, position }) => `${address}=${position.toFixed(2)}`).join(', ')
     );
   }
 }
@@ -51,7 +51,7 @@ async function assertStrictCloseComplete(accounts: CloseAccount[], symbol: strin
   if (residuals.length > 0) {
     throw new Error(
       `${symbol} strict paired close left residual positions; MARKET fallback is disabled: ` +
-      residuals.map(({ address, position }) => `${address}=${position}`).join(', ')
+      residuals.map(({ address, position }) => `${address}=${position.toFixed(2)}`).join(', ')
     );
   }
 }

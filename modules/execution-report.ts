@@ -178,11 +178,11 @@ export function formatCycleMetrics(metrics: CycleMetrics): string[] {
 
   const lines = [
     `📊 Full-cycle PnL: ${formatSignedUsd(metrics.netPnl)}`,
-    `💸 Fees: -${metrics.totalFees.toFixed(4)}$ ` +
-      `(open -${metrics.openingFees.toFixed(4)}$ | close -${metrics.closingFees.toFixed(4)}$)`,
+    `💸 Fees: -${metrics.totalFees.toFixed(2)}$ ` +
+      `(open -${metrics.openingFees.toFixed(2)}$ | close -${metrics.closingFees.toFixed(2)}$)`,
     `↔️ Разница цен LONG/SHORT: ${formatSignedUsd(metrics.totalPriceGapPnl)}`,
     `💰 Turnover (open + close): $${metrics.actualVolume.toFixed(2)} | ` +
-      `Cost: ${costPer100k.toFixed(3)}$ / 100k`,
+      `Cost: ${costPer100k.toFixed(2)}$ / 100k`,
   ];
   if (Math.abs(metrics.funding) >= 0.01) {
     lines.splice(3, 0, `⏱ Funding: ${formatSignedUsd(metrics.funding)}`);

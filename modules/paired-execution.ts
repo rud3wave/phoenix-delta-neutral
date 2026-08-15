@@ -122,8 +122,8 @@ export async function executePaired(params: PairedExecutionParams): Promise<void
   }
   if (!makerOnly && Math.abs(makerTotal - takerTotal) > EPSILON) {
     throw new Error(
-      `Paired ${symbol} target mismatch: maker ${makerTotal.toFixed(8)} / ` +
-      `taker ${takerTotal.toFixed(8)}`
+      `Paired ${symbol} target mismatch: maker ${makerTotal.toFixed(2)} / ` +
+      `taker ${takerTotal.toFixed(2)}`
     );
   }
 
@@ -210,15 +210,15 @@ export async function executePaired(params: PairedExecutionParams): Promise<void
     const actualTotal = finalProgress.reduce((sum, value) => sum + value, 0);
     if (actualTotal + 1e-8 < desiredTotal) {
       throw new Error(
-        `Unable to hedge ${symbol} maker fill: ${actualTotal.toFixed(8)}/${desiredTotal.toFixed(8)}`
+        `Unable to hedge ${symbol} maker fill: ${actualTotal.toFixed(2)}/${desiredTotal.toFixed(2)}`
       );
     }
   };
 
   console.log(makerOnly
-    ? `  Maker-only ${symbol}: ${makerSide.toUpperCase()} ${makerTotal.toFixed(6)}`
-    : `  Paired ${symbol}: maker ${makerSide.toUpperCase()} ${makerTotal.toFixed(6)} / ` +
-      `taker ${takerSide.toUpperCase()} ${takerTotal.toFixed(6)}`
+    ? `  Maker-only ${symbol}: ${makerSide.toUpperCase()} ${makerTotal.toFixed(2)}`
+    : `  Paired ${symbol}: maker ${makerSide.toUpperCase()} ${makerTotal.toFixed(2)} / ` +
+      `taker ${takerSide.toUpperCase()} ${takerTotal.toFixed(2)}`
   );
 
   let makerOrdersActive = false;
@@ -265,7 +265,7 @@ export async function executePaired(params: PairedExecutionParams): Promise<void
             reduceOnly,
           });
           console.log(
-            `  Maker ${shortAddr(target.service.getAddress())}: ${remaining.toFixed(6)} ${symbol}`
+            `  Maker ${shortAddr(target.service.getAddress())}: ${remaining.toFixed(2)} ${symbol}`
           );
           return result;
         }));
@@ -311,7 +311,7 @@ export async function executePaired(params: PairedExecutionParams): Promise<void
       if (orderAgeExpired || driftPercent >= MAKER_REQUOTE_THRESHOLD_PERCENT) {
         const reason = orderAgeExpired
           ? `quote age ${makerOrderMaxAgeSec}s`
-          : `quote drift ${driftPercent.toFixed(4)}%`;
+          : `quote drift ${driftPercent.toFixed(2)}%`;
         console.log(`  Maker ${reason}: cancelling and re-pricing ${symbol}`);
         await cancelMakerOrders(true);
         makerOrdersActive = false;
@@ -328,7 +328,7 @@ export async function executePaired(params: PairedExecutionParams): Promise<void
     await hedgeToMakerProgress(finalMakerProgress);
     if (finalMakerProgress + 1e-8 < makerTotal) {
       throw new Error(
-        `Maker target incomplete for ${symbol}: ${finalMakerProgress.toFixed(8)}/${makerTotal.toFixed(8)}`
+        `Maker target incomplete for ${symbol}: ${finalMakerProgress.toFixed(2)}/${makerTotal.toFixed(2)}`
       );
     }
   } finally {

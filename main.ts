@@ -11,7 +11,7 @@
 
 import { createInterface } from 'node:readline';
 
-import { SHUFFLE_WALLETS, TOKENS_TO_TRADE } from './settings.js';
+import { ID_FILTER, SHUFFLE_WALLETS, TOKENS_TO_TRADE } from './settings.js';
 import { DeltaNeutralController } from './modules/controller.js';
 import { closeLeaderFollower } from './modules/close-strategy.js';
 import {
@@ -24,14 +24,15 @@ import { PhoenixService } from './modules/phoenix-service.js';
 import { sendTg } from './modules/telegram.js';
 import {
   loadWallets,
-  readPrivateKeys,
   readProxies,
   saveEncryptedWallets,
   loadEncryptedWallets,
   createKeypair,
   checkAssignedProxiesHealth,
+  readPrivateKeyEntries,
   type WalletAccount,
 } from './modules/wallet.js';
+import { filterWalletsById } from './modules/wallet-filter.js';
 import { sleep, shuffleArray, shortAddr } from './modules/utils.js';
 import {
   acquireTradingLock,
@@ -71,8 +72,9 @@ function askMode(): Promise<string> {
 // ==================== WALLET INITIALIZATION ====================
 
 async function initWallets(): Promise<WalletAccount[]> {
-  // Always read from privatekeys.txt to check for changes
-  const rawKeys = readPrivateKeys();
+  // Always read from privatekeys.txt to check for changes and preserve physical line IDs.
+  const keyEntries = readPrivateKeyEntries();
+  const rawKeys = keyEntries.map((entry) => entry.privateKey);
   const txtAddresses = rawKeys.map((k) => createKeypair(k).publicKey.toString());
 
   // Try loading from encrypted storage
@@ -88,8 +90,12 @@ async function initWallets(): Promise<WalletAccount[]> {
 
     if (match) {
       console.log(`🔓 Loaded ${encrypted.length} wallet(s) from encrypted storage`);
-      await checkAssignedProxiesHealth(encrypted);
-      return encrypted;
+      const wallets = encrypted.map((wallet, index) => ({
+        ...wallet,
+        id: keyEntries[index]!.id,
+      }));
+      await checkAssignedProxiesHealth(wallets);
+      return wallets;
     }
 
     console.log(`\n🔄 privatekeys.txt changed (${txtAddresses.length} keys) vs DB (${dbAddresses.length} keys) — re-encrypting...`);
@@ -98,7 +104,7 @@ async function initWallets(): Promise<WalletAccount[]> {
   }
 
   // Load from txt and encrypt
-  const wallets = await loadWallets();
+  const wallets = await loadWallets(keyEntries);
   saveEncryptedWallets(rawKeys, wallets);
 
   return wallets;
@@ -499,6 +505,14 @@ async function main(): Promise<void> {
   let wallets: WalletAccount[];
   try {
     wallets = await initWallets();
+    const walletCountBeforeFilter = wallets.length;
+    wallets = filterWalletsById(wallets, ID_FILTER);
+    if (wallets.length === 0) {
+      throw new Error('Wallet ID filter selected no wallets');
+    }
+    if (wallets.length !== walletCountBeforeFilter) {
+      console.log(`🔒 Wallet filter selected ${wallets.length}/${walletCountBeforeFilter} wallet(s)`);
+    }
   } catch (e: any) {
     console.log(`\n❌ Failed to load wallets: ${e.message}`);
     process.exit(1);

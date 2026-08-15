@@ -26,6 +26,7 @@ export interface WalletAccount {
   address: string;
   proxyUrl?: string;
   index: number;
+  id: number;
 }
 
 interface EncryptedWalletEntry {
@@ -33,6 +34,11 @@ interface EncryptedWalletEntry {
   encryptedKey: string;
   proxyUrl?: string;
   index: number;
+}
+
+export interface PrivateKeyEntry {
+  privateKey: string;
+  id: number;
 }
 
 // ==================== SLIP10 DERIVATION ====================
@@ -136,14 +142,29 @@ function readLines(filePath: string): string[] {
 }
 
 /** Read private keys from input_data/privatekeys.txt */
-export function readPrivateKeys(): string[] {
+export function parsePrivateKeyEntries(content: string): PrivateKeyEntry[] {
+  return content
+    .split(/\r?\n/)
+    .map((line, index) => ({ privateKey: line.trim(), id: index + 1 }))
+    .filter(({ privateKey }) => privateKey.length > 0 && !privateKey.startsWith('#'));
+}
+
+export function readPrivateKeyEntries(): PrivateKeyEntry[] {
   const filePath = join(ROOT, 'input_data', 'privatekeys.txt');
-  const keys = readLines(filePath);
-  if (keys.length === 0) {
+  if (!existsSync(filePath)) {
     throw new Error(`No private keys found in ${filePath}`);
   }
-  console.log(`📂 Loaded ${keys.length} private key(s) from privatekeys.txt`);
-  return keys;
+
+  const entries = parsePrivateKeyEntries(readFileSync(filePath, 'utf-8'));
+  if (entries.length === 0) {
+    throw new Error(`No private keys found in ${filePath}`);
+  }
+  console.log(`📂 Loaded ${entries.length} private key(s) from privatekeys.txt`);
+  return entries;
+}
+
+export function readPrivateKeys(): string[] {
+  return readPrivateKeyEntries().map((entry) => entry.privateKey);
 }
 
 /** Read proxies from input_data/proxies.txt */
@@ -201,16 +222,15 @@ export async function checkProxiesHealth(proxyUrls: string[]): Promise<string[]>
  * Dead proxies are excluded before assignment.
  * Returns array of WalletAccount with keypairs ready to use.
  */
-export async function loadWallets(): Promise<WalletAccount[]> {
-  const keys = readPrivateKeys();
+export async function loadWallets(entries = readPrivateKeyEntries()): Promise<WalletAccount[]> {
   const proxies = await checkProxiesHealth(readProxies());
 
   if (proxies.length === 0) {
     warnNoProxies();
   }
 
-  const wallets: WalletAccount[] = keys.map((key, index) => {
-    const keypair = createKeypair(key);
+  const wallets: WalletAccount[] = entries.map((entry, index) => {
+    const keypair = createKeypair(entry.privateKey);
     const proxyUrl = proxies.length > 0 ? proxies[index % proxies.length] : undefined;
 
     return {
@@ -218,13 +238,14 @@ export async function loadWallets(): Promise<WalletAccount[]> {
       address: keypair.publicKey.toString(),
       proxyUrl,
       index,
+      id: entry.id,
     };
   });
 
   console.log(`✅ Created ${wallets.length} wallet(s):`);
   for (const w of wallets) {
     const proxy = w.proxyUrl ? ` | proxy: ${maskProxy(w.proxyUrl)}` : ' | no proxy';
-    console.log(`   [${w.index}] ${w.address.slice(0, 8)}...${w.address.slice(-6)}${proxy}`);
+    console.log(`   ${w.address.slice(0, 8)}...${w.address.slice(-6)}${proxy}`);
   }
 
   return wallets;
@@ -301,6 +322,8 @@ export function loadEncryptedWallets(): WalletAccount[] | null {
         address: keypair.publicKey.toString(),
         proxyUrl: entry.proxyUrl,
         index: entry.index,
+        // Rebound to the physical privatekeys.txt line by initWallets().
+        id: entry.index + 1,
       };
     });
 

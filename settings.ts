@@ -14,7 +14,7 @@ export const SHUFFLE_WALLETS = true;
 // [['1', '100']]    — ID от 0001 до 0100 включительно
 // Форматы можно комбинировать: ['3', ['10', '13'], '20', '>100']
 // Оставьте [], чтобы использовать все кошельки.
-export const ID_FILTER: Array<string | [string, string]> = [];
+export const ID_FILTER = [];
 
 // Количество попыток при ошибке
 export const RETRY = 3;

@@ -32,7 +32,7 @@ import {
   readPrivateKeyEntries,
   type WalletAccount,
 } from './modules/wallet.js';
-import { filterWalletsById } from './modules/wallet-filter.js';
+import { filterWalletsById, type WalletIdFilter } from './modules/wallet-filter.js';
 import { sleep, shuffleArray, shortAddr } from './modules/utils.js';
 import {
   acquireTradingLock,
@@ -506,7 +506,7 @@ async function main(): Promise<void> {
   try {
     wallets = await initWallets();
     const walletCountBeforeFilter = wallets.length;
-    wallets = filterWalletsById(wallets, ID_FILTER);
+    wallets = filterWalletsById(wallets, ID_FILTER as WalletIdFilter);
     if (wallets.length === 0) {
       throw new Error('Wallet ID filter selected no wallets');
     }

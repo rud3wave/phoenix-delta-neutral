@@ -56,6 +56,36 @@ async function assertStrictCloseComplete(accounts: CloseAccount[], symbol: strin
   }
 }
 
+async function closeResidualsByMakerLimit(
+  accounts: CloseAccount[],
+  symbol: string
+): Promise<void> {
+  const positions = (await Promise.all(accounts.map(async (account) => ({
+    service: account.service,
+    position: await account.service.getSignedPositionBaseUnits(symbol),
+  })))).filter(({ position }) => Math.abs(position) > 1e-10);
+
+  for (const makerSide of ['long', 'short'] as const) {
+    const targets = positions
+      .filter(({ position }) => (position < 0 ? 'long' : 'short') === makerSide)
+      .map(({ service, position }) => ({ service, targetBaseUnits: Math.abs(position) }));
+    if (targets.length === 0) continue;
+
+    console.log(`\n  Closing unpaired ${symbol} residual strictly via maker LIMIT...`);
+    await executePaired({
+      symbol,
+      makerSide,
+      takerSide: makerSide === 'long' ? 'short' : 'long',
+      makerTargets: targets,
+      takerTargets: [],
+      reduceOnly: true,
+      haltCheck: () => false,
+      maxMakerWaitSec: null,
+      makerOnly: true,
+    });
+  }
+}
+
 export async function closeLeaderFollower(
   limitAccounts: CloseAccount[],
   marketAccounts: CloseAccount[],
@@ -72,7 +102,9 @@ export async function closeLeaderFollower(
     return;
   }
   if (limitAccounts.length === 0 || marketAccounts.length === 0) {
-    throw new Error(`${symbol} strict paired close requires leader and follower accounts`);
+    await closeResidualsByMakerLimit(all, symbol);
+    await assertStrictCloseComplete(all, symbol);
+    return;
   }
 
   const makerPositions = await Promise.all(limitAccounts.map(async (account) => ({
@@ -90,13 +122,17 @@ export async function closeLeaderFollower(
     return;
   }
   if (makerActive.length === 0 || takerActive.length === 0) {
-    throw new Error(`${symbol} strict paired close requires active positions on both sides`);
+    await closeResidualsByMakerLimit(all, symbol);
+    await assertStrictCloseComplete(all, symbol);
+    return;
   }
 
   const makerSide = makerActive[0]!.position > 0 ? 'short' : 'long';
   const takerSide = takerActive[0]!.position > 0 ? 'short' : 'long';
   if (makerSide === takerSide) {
-    throw new Error(`${symbol} strict paired close requires opposite maker and follower positions`);
+    await closeResidualsByMakerLimit(all, symbol);
+    await assertStrictCloseComplete(all, symbol);
+    return;
   }
 
   const makerTotal = makerActive.reduce((sum, entry) => sum + Math.abs(entry.position), 0);
@@ -128,5 +164,6 @@ export async function closeLeaderFollower(
     haltCheck: () => false,
     maxMakerWaitSec: null,
   });
+  await closeResidualsByMakerLimit(all, symbol);
   await assertStrictCloseComplete(all, symbol);
 }

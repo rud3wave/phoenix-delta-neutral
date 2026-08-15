@@ -550,7 +550,7 @@ export class PhoenixService {
   public async quantizeBaseUnits(symbol: string, baseUnits: number): Promise<number> {
     const decimals = await this.getBaseLotsDecimals(symbol);
     const scale = Math.pow(10, decimals);
-    return Math.floor((Math.max(0, baseUnits) + Number.EPSILON) * scale) / scale;
+    return Math.floor((Math.max(0, baseUnits) + 1e-10) * scale) / scale;
   }
 
   // ==================== CLOSE POSITIONS ====================

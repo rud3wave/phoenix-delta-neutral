@@ -26,6 +26,7 @@ export interface PairedExecutionParams {
   haltCheck?: () => boolean;
   maxMakerWaitSec?: number | null;
   makerOrderMaxAgeSec?: number;
+  makerOnly?: boolean;
 }
 
 interface TrackedTarget extends PairedAccountTarget {
@@ -70,21 +71,28 @@ export async function allocateTargets(
 ): Promise<PairedAccountTarget[]> {
   if (accounts.length === 0 || totalBaseUnits <= 0) return [];
 
-  const totalWeight = accounts.reduce((sum, account) => sum + Math.max(account.weight, 0), 0);
+  const weightedAccounts = accounts.filter((account) => account.weight > 0);
+  const totalWeight = weightedAccounts.reduce((sum, account) => sum + account.weight, 0);
   if (totalWeight <= 0) throw new Error('Cannot allocate paired targets with zero total weight');
 
+  const decimals = await weightedAccounts[0]!.service.getBaseLotsDecimals(symbol);
+  const scale = Math.pow(10, decimals);
+  const totalLots = Math.max(0, Math.round(totalBaseUnits * scale));
+  if (totalLots === 0) return [];
+
   const targets: PairedAccountTarget[] = [];
-  let allocated = 0;
-  for (let i = 0; i < accounts.length; i++) {
-    const account = accounts[i]!;
-    const raw = i === accounts.length - 1
-      ? Math.max(0, totalBaseUnits - allocated)
-      : totalBaseUnits * (Math.max(account.weight, 0) / totalWeight);
-    const quantized = await account.service.quantizeBaseUnits(symbol, raw);
-    targets.push({ service: account.service, targetBaseUnits: quantized });
-    allocated += quantized;
+  let allocatedLots = 0;
+  for (let i = 0; i < weightedAccounts.length; i++) {
+    const account = weightedAccounts[i]!;
+    const targetLots = i === weightedAccounts.length - 1
+      ? totalLots - allocatedLots
+      : Math.floor(totalLots * (account.weight / totalWeight));
+    allocatedLots += targetLots;
+    if (targetLots > 0) {
+      targets.push({ service: account.service, targetBaseUnits: targetLots / scale });
+    }
   }
-  return targets.filter((target) => target.targetBaseUnits > EPSILON);
+  return targets;
 }
 
 export async function executePaired(params: PairedExecutionParams): Promise<void> {
@@ -98,8 +106,9 @@ export async function executePaired(params: PairedExecutionParams): Promise<void
     haltCheck = isTradingHalted,
     maxMakerWaitSec = MAX_MAKER_WAIT_SEC,
     makerOrderMaxAgeSec = DEFAULT_MAKER_ORDER_MAX_AGE_SEC,
+    makerOnly = false,
   } = params;
-  if (makerTargets.length === 0 || takerTargets.length === 0) {
+  if (makerTargets.length === 0 || (!makerOnly && takerTargets.length === 0)) {
     throw new Error(`Paired ${symbol} execution requires both maker and taker accounts`);
   }
   if (!Number.isFinite(makerOrderMaxAgeSec) || makerOrderMaxAgeSec <= 0) {
@@ -108,8 +117,14 @@ export async function executePaired(params: PairedExecutionParams): Promise<void
 
   const makerTotal = sumTargets(makerTargets);
   const takerTotal = sumTargets(takerTargets);
-  if (makerTotal <= EPSILON || takerTotal <= EPSILON) {
+  if (makerTotal <= EPSILON || (!makerOnly && takerTotal <= EPSILON)) {
     throw new Error(`Paired ${symbol} execution has an empty target`);
+  }
+  if (!makerOnly && Math.abs(makerTotal - takerTotal) > EPSILON) {
+    throw new Error(
+      `Paired ${symbol} target mismatch: maker ${makerTotal.toFixed(8)} / ` +
+      `taker ${takerTotal.toFixed(8)}`
+    );
   }
 
   await Promise.all([...makerTargets, ...takerTargets].map((target) => target.service.warmOrderClient()));
@@ -135,6 +150,7 @@ export async function executePaired(params: PairedExecutionParams): Promise<void
   };
 
   const hedgeToMakerProgress = async (makerFilled: number): Promise<void> => {
+    if (makerOnly) return;
     const fraction = Math.max(0, Math.min(1, makerFilled / makerTotal));
 
     for (let attempt = 1; attempt <= MAX_HEDGE_RETRIES; attempt++) {
@@ -199,9 +215,10 @@ export async function executePaired(params: PairedExecutionParams): Promise<void
     }
   };
 
-  console.log(
-    `  Paired ${symbol}: maker ${makerSide.toUpperCase()} ${makerTotal.toFixed(6)} / ` +
-    `taker ${takerSide.toUpperCase()} ${takerTotal.toFixed(6)}`
+  console.log(makerOnly
+    ? `  Maker-only ${symbol}: ${makerSide.toUpperCase()} ${makerTotal.toFixed(6)}`
+    : `  Paired ${symbol}: maker ${makerSide.toUpperCase()} ${makerTotal.toFixed(6)} / ` +
+      `taker ${takerSide.toUpperCase()} ${takerTotal.toFixed(6)}`
   );
 
   let makerOrdersActive = false;

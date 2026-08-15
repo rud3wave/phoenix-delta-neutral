@@ -2,13 +2,14 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { closeLeaderFollower } from '../modules/close-strategy.js';
-import { executePaired } from '../modules/paired-execution.js';
+import { allocateTargets, executePaired } from '../modules/paired-execution.js';
 import type { PhoenixService } from '../modules/phoenix-service.js';
 
 interface FakeService extends Pick<
   PhoenixService,
   | 'warmOrderClient'
   | 'getSignedPositionBaseUnits'
+  | 'getBaseLotsDecimals'
   | 'quantizeBaseUnits'
   | 'cancelAllOrders'
   | 'placePositionOrder'
@@ -23,6 +24,7 @@ test('executePaired hedges incremental maker fills instead of waiting for full f
 
   const common = {
     warmOrderClient: async () => {},
+    getBaseLotsDecimals: async () => 3,
     quantizeBaseUnits: async (_symbol: string, value: number) => Math.floor((value + 1e-10) * 1000) / 1000,
     cancelAllOrders: async () => {},
   };
@@ -71,6 +73,7 @@ test('strict close never degrades a maker failure to MARKET closes', async () =>
   let marketCloseCalls = 0;
   const common = {
     warmOrderClient: async () => {},
+    getBaseLotsDecimals: async () => 3,
     quantizeBaseUnits: async (_symbol: string, value: number) => value,
     cancelAllOrders: async () => {},
     closePositionByMarket: async () => { marketCloseCalls++; },
@@ -142,4 +145,51 @@ test('executePaired cancels and re-prices an unfilled maker order after its max 
   assert.equal(makerPlacements, 2);
   assert.equal(forcedCancels, 1);
   assert.equal(makerPosition + followerPosition, 0);
+});
+
+test('allocateTargets preserves the exact total in integer base lots', async () => {
+  const first = {
+    getBaseLotsDecimals: async () => 3,
+  } as unknown as PhoenixService;
+  const second = {
+    getBaseLotsDecimals: async () => 3,
+  } as unknown as PhoenixService;
+
+  const targets = await allocateTargets(7.339, [
+    { service: first, weight: 3.325 },
+    { service: second, weight: 4.014 },
+  ], 'ETH');
+
+  assert.deepEqual(targets.map(({ targetBaseUnits }) => targetBaseUnits), [3.325, 4.014]);
+  assert.equal(targets.reduce((sum, target) => sum + target.targetBaseUnits, 0), 7.339);
+});
+
+test('executePaired rejects unequal leg totals before placing orders', async () => {
+  const service = {} as PhoenixService;
+  await assert.rejects(executePaired({
+    symbol: 'ETH',
+    makerSide: 'long',
+    takerSide: 'short',
+    makerTargets: [{ service, targetBaseUnits: 7.338 }],
+    takerTargets: [{ service, targetBaseUnits: 7.339 }],
+  }), /target mismatch/);
+});
+
+test('strict close removes a one-lot residual with maker LIMIT only', async () => {
+  let residualPosition = -0.001;
+  const residual = {
+    getAddress: () => 'residual-wallet',
+    warmOrderClient: async () => {},
+    getSignedPositionBaseUnits: async () => residualPosition,
+    cancelAllOrders: async () => {},
+    placePositionOrder: async (params: any) => {
+      assert.equal(params.executionType, 'post-only');
+      assert.equal(params.reduceOnly, true);
+      residualPosition = 0;
+      return { rfqId: 'residual', makerReferencePrice: 100 };
+    },
+  } as unknown as PhoenixService;
+  await closeLeaderFollower([{ service: residual }], [], 'ETH');
+
+  assert.equal(residualPosition, 0);
 });

@@ -945,20 +945,6 @@ export class PhoenixService {
         orderPrice = limitPrice;
         makerReferencePrice = executionSide === 'long' ? bestAsk : bestBid;
 
-        const spreadPercent = (((bestAsk - bestBid) / bestBid) * 100).toFixed(2);
-        if (executionType === 'post-only') {
-          console.log(
-            `  📋 Post-only ${executionSide.toUpperCase()} at maker top ` +
-            `| BBO: ${bestBid.toFixed(2)}/${bestAsk.toFixed(2)} | ` +
-            `slide ref: ${limitPrice.toFixed(2)} | spread: ${spreadPercent}%`
-          );
-        } else {
-          console.log(
-            `  📋 Limit ${executionSide.toUpperCase()} @ ${limitPrice.toFixed(2)} ` +
-            `(mid: ${midPrice.toFixed(2)}, spread: ${spreadPercent}%)`
-          );
-        }
-
         let ix: any;
         if (executionType === 'post-only') {
           const orderPacket: PostOnlyOrderPacket = {
@@ -1035,10 +1021,11 @@ export class PhoenixService {
 
     await this.waitForConfirmation(txHash);
 
-    const amountLabel = amountUsd > 0 ? ` | $${amountUsd.toFixed(2)}` : '';
+    const displayPrice = orderPrice ?? midPrice;
+    const priceLabel = orderPrice === undefined ? 'MARKET' : `$${orderPrice.toFixed(2)}`;
     console.log(
-      `  ✅ Order placed: ${executionSide.toUpperCase()} ${instrument}${amountLabel} | ` +
-      formatTransactionLink(txHash)
+      `  ✅ ${executionSide.toUpperCase()} | ${quantity.toFixed(2)} ${instrument} | ` +
+      `${priceLabel} | $${(quantity * displayPrice).toFixed(2)}`
     );
 
     return { rfqId: txHash, orderPrice, makerReferencePrice };

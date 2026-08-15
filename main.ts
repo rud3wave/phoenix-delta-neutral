@@ -4,6 +4,9 @@
 // Mode 1: Delta-neutral trading
 // Mode 2: Close all positions
 // Mode 3: Check balances
+// Mode 4: Claim rewards
+// Mode 5: Deposit USDC
+// Mode 6: Withdraw USDC
 // ============================================================
 
 import { createInterface } from 'node:readline';
@@ -56,7 +59,7 @@ function askMode(): Promise<string> {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   return new Promise((resolve) => {
     rl.question(
-      `\nВыбери режим:\n  1 = Дельта-нейтральная торговля\n  2 = Закрыть все позиции\n  3 = Проверить балансы\n  4 = Клеймить награды\n  5 = Пополнить биржу с кошелька\n\n> `,
+      `\nВыбери режим:\n  1 = Дельта-нейтральная торговля\n  2 = Закрыть все позиции\n  3 = Проверить балансы\n  4 = Клеймить награды\n  5 = Пополнить биржу с кошелька\n  6 = Вывод средств\n\n> `,
       (answer) => {
         rl.close();
         resolve(answer.trim());
@@ -407,6 +410,56 @@ async function depositUsdc(services: PhoenixService[]): Promise<void> {
   await sendTg(lines.join('\n'));
 }
 
+// ==================== MODE 6: WITHDRAW USDC ====================
+
+async function withdrawUsdc(services: PhoenixService[]): Promise<void> {
+  console.log('\n💸 Withdrawing USDC from exchange to wallets...\n');
+
+  const results = await Promise.all(services.map(async (service) => {
+    const addr = shortAddr(service.getAddress());
+    try {
+      const result = await service.withdrawUsdc();
+      if (result.withdrawn > 0) {
+        return {
+          line: `✅ ${addr} | +$${result.withdrawn.toFixed(2)} to wallet`,
+          withdrawn: result.withdrawn,
+        };
+      }
+      return { line: '', withdrawn: 0 };
+    } catch (e: any) {
+      console.log(`  ⚠️ ${addr} | ${e.message}`);
+      return { line: `⚠️ ${addr} | ${e.message}`, withdrawn: 0 };
+    }
+  }));
+
+  const lines: string[] = ['💸 Вывод средств', ''];
+  let totalWithdrawn = 0;
+  let withdrawCount = 0;
+  for (const result of results) {
+    if (result.line) lines.push(result.line);
+    if (result.withdrawn > 0) {
+      withdrawCount++;
+      totalWithdrawn += result.withdrawn;
+    }
+  }
+
+  lines.push(
+    '',
+    `Выведено: $${totalWithdrawn.toFixed(2)} с ${withdrawCount}/${services.length} кошельков`
+  );
+
+  if (withdrawCount > 0) {
+    console.log(
+      `\n✅ Withdrawn $${totalWithdrawn.toFixed(2)} to ` +
+      `${withdrawCount}/${services.length} wallet(s)`
+    );
+  } else {
+    console.log('\nℹ️ Nothing to withdraw');
+  }
+
+  await sendTg(lines.join('\n'));
+}
+
 // ==================== GRACEFUL SHUTDOWN ====================
 
 let controllerRef: DeltaNeutralController | null = null;
@@ -487,8 +540,11 @@ async function main(): Promise<void> {
       case '5':
         await depositUsdc(services);
         break;
+      case '6':
+        await withdrawUsdc(services);
+        break;
       default:
-        console.log(`\n❌ Неизвестный режим: "${mode}". Выбери 1, 2, 3, 4 или 5.`);
+        console.log(`\n❌ Неизвестный режим: "${mode}". Выбери 1, 2, 3, 4, 5 или 6.`);
         process.exit(1);
     }
   } catch (e: any) {

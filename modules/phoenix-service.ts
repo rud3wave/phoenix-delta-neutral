@@ -1366,6 +1366,117 @@ export class PhoenixService {
     }
   }
 
+  /**
+   * Withdraw all exchange collateral to the wallet's USDC token account.
+   * Refuses to withdraw while any position or order is active.
+   */
+  public async withdrawUsdc(): Promise<{ withdrawn: number; txHashes: string[] }> {
+    const tag = this.walletAddress.slice(0, 6);
+    const state = await this.apiClient.getTraderState(this.walletAddress);
+    const subaccounts = state.snapshot?.subaccounts ?? [];
+    const hasPositions = subaccounts.some((subaccount) =>
+      (subaccount.positions ?? []).some((position) => Number(position.basePositionLots) !== 0)
+    );
+    const hasOrders = subaccounts.some((subaccount) =>
+      (subaccount.orders ?? []).some((group) =>
+        (group.orders ?? []).some((order) => {
+          const status = order.status.toLowerCase();
+          const isClosed = ['cancelled', 'canceled', 'filled', 'closed', 'expired'].includes(status);
+          return !isClosed && (
+            status === 'open' ||
+            status === 'active' ||
+            Number(order.sizeRemainingLots) > 0
+          );
+        })
+      )
+    );
+
+    if (hasPositions || hasOrders) {
+      throw new Error('Close all positions and cancel active orders before withdrawal');
+    }
+
+    const balances = subaccounts.map((subaccount) => ({
+      subaccountIndex: subaccount.subaccountIndex,
+      amount: Math.floor(Number(subaccount.collateral || '0')),
+    })).filter(({ amount }) => Number.isSafeInteger(amount) && amount > 0);
+    const totalAmount = balances.reduce((sum, balance) => sum + balance.amount, 0);
+    if (totalAmount <= 0) {
+      console.log(`  ℹ️ [${tag}] No exchange USDC to withdraw`);
+      return { withdrawn: 0, txHashes: [] };
+    }
+
+    console.log(
+      `  💸 [${tag}] Exchange USDC: $${(totalAmount / 1e6).toFixed(2)} — ` +
+      'withdrawing to wallet...'
+    );
+
+    const client = createPhoenixClient({
+      apiUrl: PHOENIX_API_URL,
+      rpcUrl: this.connection.rpcEndpoint,
+      auth: false,
+      ws: false,
+      exchangeMetadata: { stream: false },
+    });
+    const txHashes: string[] = [];
+    let withdrawnAmount = 0;
+
+    try {
+      for (const balance of balances) {
+        const flow = await client.ixs.buildWithdrawIxs({
+          authority: this.walletAddress as any,
+          traderPdaIndex: 0,
+          traderSubaccountIndex: balance.subaccountIndex,
+          amount: BigInt(balance.amount),
+        });
+
+        if (!flow?.instructions?.length) {
+          throw new Error(`No withdrawal instructions built for subaccount[${balance.subaccountIndex}]`);
+        }
+
+        const ixs = flow.instructions.map((ix: any) => {
+          const programId = new PublicKey(ix.programAddress ?? ix.programId?.toString() ?? '');
+          const keys = (ix.accounts ?? ix.keys ?? []).map((key: any) => ({
+            pubkey: new PublicKey(key.address ?? key.pubkey?.toString() ?? key.pubkey ?? ''),
+            isSigner: key.role === 2 || key.role === 3 || key.isSigner === true,
+            isWritable: key.role === 1 || key.role === 3 || key.isWritable === true,
+          }));
+          return new TransactionInstruction({
+            programId,
+            keys,
+            data: Buffer.from(ix.data ?? new Uint8Array()),
+          });
+        });
+
+        await sleep(1 + Math.random());
+        const { blockhash } = await this.connection.getLatestBlockhash('confirmed');
+        const messageV0 = new TransactionMessage({
+          payerKey: this.wallet.publicKey,
+          recentBlockhash: blockhash,
+          instructions: ixs,
+        }).compileToV0Message();
+        const transaction = new VersionedTransaction(messageV0);
+        transaction.sign([this.wallet]);
+
+        const txHash = await this.connection.sendTransaction(transaction, {
+          skipPreflight: false,
+          preflightCommitment: 'confirmed',
+        });
+        await this.waitForConfirmation(txHash);
+
+        txHashes.push(txHash);
+        withdrawnAmount += balance.amount;
+        console.log(
+          `  ✅ [${tag}] Withdrew $${(balance.amount / 1e6).toFixed(2)} ` +
+          `from subaccount[${balance.subaccountIndex}] | tx: ${txHash}`
+        );
+      }
+
+      return { withdrawn: withdrawnAmount / 1e6, txHashes };
+    } finally {
+      client.dispose();
+    }
+  }
+
   // ==================== TRANSACTION BUILDING ====================
 
   public async buildSignAndSendTransaction(instructions: SolanaInstruction[]): Promise<string> {

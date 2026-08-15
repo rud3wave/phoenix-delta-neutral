@@ -25,6 +25,7 @@ export interface PairedExecutionParams {
   reduceOnly?: boolean;
   haltCheck?: () => boolean;
   maxMakerWaitSec?: number | null;
+  makerOrderMaxAgeSec?: number;
 }
 
 interface TrackedTarget extends PairedAccountTarget {
@@ -32,6 +33,7 @@ interface TrackedTarget extends PairedAccountTarget {
 }
 
 const EPSILON = 1e-10;
+const DEFAULT_MAKER_ORDER_MAX_AGE_SEC = 120;
 
 function direction(side: PositionSide): number {
   return side === 'long' ? 1 : -1;
@@ -95,9 +97,13 @@ export async function executePaired(params: PairedExecutionParams): Promise<void
     reduceOnly = false,
     haltCheck = isTradingHalted,
     maxMakerWaitSec = MAX_MAKER_WAIT_SEC,
+    makerOrderMaxAgeSec = DEFAULT_MAKER_ORDER_MAX_AGE_SEC,
   } = params;
   if (makerTargets.length === 0 || takerTargets.length === 0) {
     throw new Error(`Paired ${symbol} execution requires both maker and taker accounts`);
+  }
+  if (!Number.isFinite(makerOrderMaxAgeSec) || makerOrderMaxAgeSec <= 0) {
+    throw new Error('makerOrderMaxAgeSec must be greater than zero');
   }
 
   const makerTotal = sumTargets(makerTargets);
@@ -200,6 +206,7 @@ export async function executePaired(params: PairedExecutionParams): Promise<void
 
   let makerOrdersActive = false;
   let quotedReferencePrice = 0;
+  let makerOrderPlacedAt = 0;
 
   try {
     // Cheap when the API sees no stale orders; no cancel transaction is sent.
@@ -230,6 +237,7 @@ export async function executePaired(params: PairedExecutionParams): Promise<void
 
         // Set before awaiting so a partial placement failure is always cleaned up.
         makerOrdersActive = true;
+        makerOrderPlacedAt = Date.now();
         const results = await Promise.all(placements.map(async ({ target, remaining }) => {
           const result = await target.service.placePositionOrder({
             instrument: symbol,
@@ -257,6 +265,7 @@ export async function executePaired(params: PairedExecutionParams): Promise<void
 
       const quoteCheckAt = Math.min(
         makerDeadline,
+        makerOrderPlacedAt + makerOrderMaxAgeSec * 1000,
         Date.now() + MAKER_REQUOTE_INTERVAL_SEC * 1000
       );
       while (Date.now() < quoteCheckAt && makerProgress + EPSILON < makerTotal) {
@@ -280,11 +289,13 @@ export async function executePaired(params: PairedExecutionParams): Promise<void
       const driftPercent = quotedReferencePrice > 0
         ? (Math.abs(currentReferencePrice - quotedReferencePrice) / quotedReferencePrice) * 100
         : Number.POSITIVE_INFINITY;
+      const orderAgeExpired = Date.now() - makerOrderPlacedAt >= makerOrderMaxAgeSec * 1000;
 
-      if (driftPercent >= MAKER_REQUOTE_THRESHOLD_PERCENT) {
-        console.log(
-          `  Maker quote drift ${driftPercent.toFixed(4)}%: cancelling and re-pricing ${symbol}`
-        );
+      if (orderAgeExpired || driftPercent >= MAKER_REQUOTE_THRESHOLD_PERCENT) {
+        const reason = orderAgeExpired
+          ? `quote age ${makerOrderMaxAgeSec}s`
+          : `quote drift ${driftPercent.toFixed(4)}%`;
+        console.log(`  Maker ${reason}: cancelling and re-pricing ${symbol}`);
         await cancelMakerOrders(true);
         makerOrdersActive = false;
 

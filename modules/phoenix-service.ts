@@ -937,13 +937,18 @@ export class PhoenixService {
         orderPrice = limitPrice;
         makerReferencePrice = executionSide === 'long' ? bestAsk : bestBid;
 
-        console.log(
-          `  📋 ${executionType === 'post-only' ? 'Post-only' : 'Limit'} ` +
-          `${executionSide.toUpperCase()} @ ${limitPrice} (mid: ${midPrice}, spread: ${(
-            ((bestAsk - bestBid) / bestBid) *
-            100
-          ).toFixed(4)}%)`
-        );
+        const spreadPercent = (((bestAsk - bestBid) / bestBid) * 100).toFixed(4);
+        if (executionType === 'post-only') {
+          console.log(
+            `  📋 Post-only ${executionSide.toUpperCase()} at maker top ` +
+            `| BBO: ${bestBid}/${bestAsk} | slide ref: ${limitPrice} | spread: ${spreadPercent}%`
+          );
+        } else {
+          console.log(
+            `  📋 Limit ${executionSide.toUpperCase()} @ ${limitPrice} ` +
+            `(mid: ${midPrice}, spread: ${spreadPercent}%)`
+          );
+        }
 
         let ix: any;
         if (executionType === 'post-only') {

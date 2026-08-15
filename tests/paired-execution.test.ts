@@ -94,3 +94,52 @@ test('strict close never degrades a maker failure to MARKET closes', async () =>
   );
   assert.equal(marketCloseCalls, 0);
 });
+
+test('executePaired cancels and re-prices an unfilled maker order after its max age', async () => {
+  let makerPosition = 0;
+  let followerPosition = 0;
+  let makerPlacements = 0;
+  let forcedCancels = 0;
+
+  const maker = {
+    getAddress: () => 'maker-wallet',
+    warmOrderClient: async () => {},
+    quantizeBaseUnits: async (_symbol: string, value: number) => value,
+    getSignedPositionBaseUnits: async () => makerPosition,
+    getMarketSnapshot: async () => ({ bestBid: 99.9, bestAsk: 100, midPrice: 99.95 }),
+    cancelAllOrders: async (_symbol: string, _reduceOnly: boolean, force: boolean) => {
+      if (force) forcedCancels++;
+    },
+    placePositionOrder: async () => {
+      makerPlacements++;
+      if (makerPlacements === 2) setTimeout(() => { makerPosition = 1; }, 20);
+      return { rfqId: `maker-${makerPlacements}`, makerReferencePrice: 100 };
+    },
+  } as unknown as PhoenixService;
+  const follower = {
+    getAddress: () => 'follower-wallet',
+    warmOrderClient: async () => {},
+    quantizeBaseUnits: async (_symbol: string, value: number) => value,
+    getSignedPositionBaseUnits: async () => followerPosition,
+    cancelAllOrders: async () => {},
+    placePositionOrder: async (params: any) => {
+      followerPosition -= params.overrideBaseUnits;
+      return { rfqId: 'follower' };
+    },
+  } as unknown as PhoenixService;
+
+  await executePaired({
+    symbol: 'ETH',
+    makerSide: 'long',
+    takerSide: 'short',
+    makerTargets: [{ service: maker, targetBaseUnits: 1 }],
+    takerTargets: [{ service: follower, targetBaseUnits: 1 }],
+    haltCheck: () => false,
+    maxMakerWaitSec: null,
+    makerOrderMaxAgeSec: 0.05,
+  });
+
+  assert.equal(makerPlacements, 2);
+  assert.equal(forcedCancels, 1);
+  assert.equal(makerPosition + followerPosition, 0);
+});

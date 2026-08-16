@@ -38,28 +38,40 @@ async function waitUntilClosed(
   onFilled: (acc: CloseAccount) => void
 ): Promise<CloseAccount[]> {
   const pollSec = FILL_POLL_INTERVAL_MS / 1000;
-  const polls = Math.max(1, Math.round(120 / pollSec));
+  const roundStart = Date.now();
+  const roundDeadline = roundStart + 120_000;
+  let lastLogAt = 0;
   let stillOpen: CloseAccount[] = [];
 
-  for (let i = 0; i < polls && pending.size > 0; i++) {
+  while (pending.size > 0 && Date.now() < roundDeadline) {
     await sleep(pollSec);
 
-    stillOpen = [];
-    for (const acc of pending) {
+    const results = await Promise.all([...pending].map(async (acc) => {
       try {
         const position = await acc.service.getPositionBaseUnits(symbol);
-        if (position > 1e-10) {
-          stillOpen.push(acc);
-        } else {
-          onFilled(acc);
-        }
+        return { acc, open: position > 1e-10 };
       } catch {
+        return { acc, open: true };
+      }
+    }));
+
+    stillOpen = [];
+    for (const { acc, open } of results) {
+      if (open) {
         stillOpen.push(acc);
+      } else {
+        onFilled(acc);
+        pending.delete(acc);
       }
     }
 
-    for (const acc of pending) {
-      if (!stillOpen.includes(acc)) pending.delete(acc);
+    const now = Date.now();
+    if (pending.size > 0 && now - lastLogAt >= 15_000) {
+      lastLogAt = now;
+      console.log(
+        `  ⏳ Still waiting for ${pending.size} limit close(s) to fill, ` +
+        `${Math.round((now - roundStart) / 1000)}s elapsed...`
+      );
     }
   }
 

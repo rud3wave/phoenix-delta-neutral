@@ -584,45 +584,59 @@ export class DeltaNeutralController {
     // Retry loop for leader: poll fast up to 2min, then re-place unfilled.
     // Быстрый опрос = фолловер бьёт маркетом ближе к цене филла лидера.
     const pollSec = FILL_POLL_INTERVAL_MS / 1000;
-    const pollsPerRound = Math.max(1, Math.round(120 / pollSec));
     console.log(`  ⏳ Waiting for leader fills (checking every ${FILL_POLL_INTERVAL_MS}ms, up to 2min)...`);
     while (pendingLeader.size > 0) {
-      let stillWaiting: GroupAccount[] = [];
+      const roundStart = Date.now();
+      const roundDeadline = roundStart + 120_000;
+      let lastLogAt = 0;
 
-      for (let i = 0; i < pollsPerRound && pendingLeader.size > 0; i++) {
+      while (pendingLeader.size > 0 && Date.now() < roundDeadline) {
         if (isTradingHalted()) throw new Error('Trading halted by Force Close');
         await sleep(pollSec);
 
-        stillWaiting = [];
-        for (const acc of pendingLeader) {
+        const results = await Promise.all([...pendingLeader].map(async (acc) => {
           try {
             const position = await acc.service.getPositionBaseUnits(srcToken);
-            if (position > 1e-10) {
-              console.log(`  ✅ ${shortAddr(acc.address)} leader FILLED`);
-            } else {
-              stillWaiting.push(acc);
-            }
+            return { acc, filled: position > 1e-10 };
           } catch {
-            stillWaiting.push(acc);
+            return { acc, filled: false };
+          }
+        }));
+
+        for (const { acc, filled } of results) {
+          if (filled) {
+            console.log(`  ✅ ${shortAddr(acc.address)} leader FILLED`);
+            pendingLeader.delete(acc);
           }
         }
 
-        for (const acc of pendingLeader) {
-          if (!stillWaiting.includes(acc)) pendingLeader.delete(acc);
+        const now = Date.now();
+        if (pendingLeader.size > 0 && now - lastLogAt >= 15_000) {
+          lastLogAt = now;
+          console.log(
+            `  ⏳ Still waiting for ${pendingLeader.size} leader fill(s), ` +
+            `${Math.round((now - roundStart) / 1000)}s elapsed...`
+          );
         }
       }
 
       if (pendingLeader.size === 0) break;
 
       console.log(`  🔄 ${pendingLeader.size} leader limit(s) unfilled — re-placing...`);
-      await Promise.all(stillWaiting.map(async (acc) => {
+      await Promise.all([...pendingLeader].map(async (acc) => {
         try {
           await acc.service.cancelAllOrders(srcToken);
+          // Достаём только недостающее: лидер мог заполниться частично
+          const snapshot = await acc.service.getMarketSnapshot(srcToken);
+          const filledUnits = await acc.service.getPositionBaseUnits(srcToken);
+          const remainingUnits = Math.max(0, (acc.orderAmount ?? 0) / snapshot.midPrice - filledUnits);
+          if (remainingUnits <= 0) return;
           await acc.service.placePositionOrder({
             instrument: srcToken,
             executionSide: limitSide,
             executionType: 'limit',
             amountUsd: acc.orderAmount!,
+            overrideBaseUnits: remainingUnits,
           });
         } catch (e: any) {
           console.log(`  ⚠️ Leader re-place failed for ${shortAddr(acc.address)}: ${e.message}`);

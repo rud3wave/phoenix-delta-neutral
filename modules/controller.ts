@@ -11,7 +11,6 @@
 import {
   GROUP_CONFIGS,
   LEVERAGE,
-  MIN_LIQ_DISTANCE_PERCENT,
   MAX_SPREAD,
   HOLD_MINUTES,
   TRADES_COUNT,
@@ -319,11 +318,10 @@ export class DeltaNeutralController {
       throw new Error(`LEVERAGE для ${token} не задан — добавь ${token}: [мин, макс] в settings.ts`);
     }
     const minLev = levRange[0];
-    const maxLev = Math.min(levRange[1], 100 / MIN_LIQ_DISTANCE_PERCENT);
+    const maxLev = levRange[1];
     if (maxLev < minLev) {
       throw new Error(
-        `${token}: плечо от ${minLev}x недостижимо при MIN_LIQ_DISTANCE_PERCENT=` +
-        `${MIN_LIQ_DISTANCE_PERCENT} (потолок ${maxLev.toFixed(1)}x)`
+        `LEVERAGE ${token}: мин ${minLev}x больше максимума ${maxLev}x — исправь диапазон в settings.ts`
       );
     }
 
@@ -352,7 +350,7 @@ export class DeltaNeutralController {
         `Группа не сводится в вилку при плече ${minLev}-${maxLev}x: ` +
         `LONG тянет $${longBounds.min.toFixed(0)}-${longBounds.max.toFixed(0)}, ` +
         `SHORT тянет $${shortBounds.min.toFixed(0)}-${shortBounds.max.toFixed(0)}. ` +
-        `Измени LEVERAGE, MIN_LIQ_DISTANCE_PERCENT или состав кошельков.`
+        `Измени LEVERAGE или состав кошельков.`
       );
     }
 

@@ -653,23 +653,40 @@ export class DeltaNeutralController {
       return totalLimitBaseUnits * weight;
     });
 
-    // Follower places MARKET orders (parallel, exact lot matching)
+    // Follower places MARKET orders (parallel, exact lot matching).
+    // Ошибка фолловера недопустима: группа осталась бы односторонней,
+    // поэтому ретраим, а при полном провале откатываем ногу лидера.
     console.log(`\n  🚀 ${marketSide.toUpperCase()} placing MARKET orders (delta-matched)...`);
     if (isTradingHalted()) throw new Error('Trading halted by Force Close');
+
+    const failedFollowers: GroupAccount[] = [];
     await Promise.all(marketAccounts.map(async (acc, i) => {
-      try {
-        await acc.service.placePositionOrder({
-          instrument: srcToken,
-          executionSide: marketSide,
-          executionType: 'market',
-          amountUsd: acc.orderAmount!,
-          overrideBaseUnits: followerBaseUnits[i],
-        });
-        console.log(`  ✅ ${shortAddr(acc.address)} follower MARKET filled`);
-      } catch (e: any) {
-        console.log(`  ❌ MARKET order failed for ${shortAddr(acc.address)}: ${e.message}`);
-        await this.handleFailure(acc, e);
+      let lastError: any = null;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          await acc.service.placePositionOrder({
+            instrument: srcToken,
+            executionSide: marketSide,
+            executionType: 'market',
+            amountUsd: acc.orderAmount!,
+            overrideBaseUnits: followerBaseUnits[i],
+          });
+          console.log(`  ✅ ${shortAddr(acc.address)} follower MARKET filled`);
+          return;
+        } catch (e: any) {
+          lastError = e;
+          console.log(`  ❌ MARKET order failed for ${shortAddr(acc.address)} (attempt ${attempt}/3): ${e.message}`);
+          if (attempt < 3) await sleep(1);
+        }
       }
+      failedFollowers.push(acc);
+      await this.handleFailure(acc, lastError);
     }));
+
+    if (failedFollowers.length > 0) {
+      throw new Error(
+        `${failedFollowers.length} follower(s) failed to open after retries — unwinding leader side`
+      );
+    }
   }
 }

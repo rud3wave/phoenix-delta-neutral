@@ -900,7 +900,15 @@ export class PhoenixService {
       throw new Error(`Invalid mid price for ${instrument}`);
     }
 
-    const quantity = overrideBaseUnits ?? amountUsd / midPrice;
+    // Размер всегда выравнивается до целых лотов: on-chain программа
+    // отклоняет ордера с дробными лотами (InvalidInstructionData).
+    const quantity = await this.quantizeBaseUnits(
+      instrument,
+      overrideBaseUnits ?? amountUsd / midPrice
+    );
+    if (quantity <= 0) {
+      throw new Error(`Order quantity for ${instrument} rounds to zero lots`);
+    }
 
     const client = await this.getOrderClient();
 

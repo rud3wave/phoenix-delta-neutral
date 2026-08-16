@@ -16,6 +16,21 @@ export interface CloseAccount {
   service: PhoenixService;
 }
 
+/** Маркет-закрытие с ретраями: транзитентная ошибка не должна оставлять позицию открытой. */
+async function closeByMarketWithRetry(acc: CloseAccount, symbol: string, attempts = 3): Promise<void> {
+  let lastError: any = null;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      await acc.service.closePositionByMarket(symbol);
+      return;
+    } catch (e: any) {
+      lastError = e;
+      if (attempt < attempts) await sleep(1);
+    }
+  }
+  throw lastError;
+}
+
 /** Один раунд ожидания: быстрый опрос позиций до 2 минут. */
 async function waitUntilClosed(
   pending: Set<CloseAccount>,
@@ -69,7 +84,7 @@ export async function closeLeaderFollower(
     console.log(`\n  🚀 Closing ALL ${all.length} ${symbol} via MARKET (all-market mode)...`);
     await Promise.all(all.map(async (acc) => {
       try {
-        await acc.service.closePositionByMarket(symbol);
+        await closeByMarketWithRetry(acc, symbol);
         console.log(`  ✅ ${shortAddr(acc.service.getAddress())} closed via MARKET`);
       } catch (e: any) {
         console.log(`  ❌ Market close failed for ${shortAddr(acc.service.getAddress())}: ${e.message}`);
@@ -172,7 +187,7 @@ export async function closeLeaderFollower(
     console.log(`\n  🚀 Follower (${marketAccounts.length}) closing ${symbol} via MARKET (taker)...`);
     await Promise.all(marketAccounts.map(async (acc) => {
       try {
-        await acc.service.closePositionByMarket(symbol);
+        await closeByMarketWithRetry(acc, symbol);
         console.log(`  ✅ ${shortAddr(acc.service.getAddress())} follower closed via MARKET`);
       } catch (e: any) {
         console.log(`  ❌ Market close failed for ${shortAddr(acc.service.getAddress())}: ${e.message}`);
@@ -223,7 +238,7 @@ export async function closeLeaderFollower(
     await Promise.all([...pendingFollower].map(async (acc) => {
       try {
         await acc.service.cancelAllOrders(symbol);
-        await acc.service.closePositionByMarket(symbol);
+        await closeByMarketWithRetry(acc, symbol);
         console.log(`  ✅ ${shortAddr(acc.service.getAddress())} follower closed via MARKET (fallback)`);
       } catch (e: any) {
         console.log(`  ❌ Market close failed for ${shortAddr(acc.service.getAddress())}: ${e.message}`);

@@ -190,7 +190,7 @@ phoenix-delta-neutral/
 │   └── wallets.json         # Зашифрованные ключи (создаётся автоматически)
 └── modules/
     ├── allocation.ts        # Математика аллокации notional
-    ├── close-strategy.ts    # Закрытие: leader LIMIT → follower MARKET
+    ├── close-strategy.ts    # Закрытие: обе стороны лимитками одновременно
     ├── controller.ts        # Дельта-нейтральный контроллер
     ├── phoenix-api.ts       # REST API клиент Phoenix
     ├── phoenix-service.ts   # Торговый сервис (ордера, claim, депозит/вывод)

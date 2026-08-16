@@ -44,7 +44,7 @@ import {
 import nacl from 'tweetnacl';
 import { gotScraping } from 'got-scraping';
 
-import { formatTransactionLink, isMidStable, sleep } from './utils.js';
+import { formatTransactionLink, isMidStable, shortAddr, sleep } from './utils.js';
 import {
   PhoenixApiClient,
   type PendingEscrowRequest,
@@ -693,22 +693,24 @@ export class PhoenixService {
 
   // ==================== CLOSE BY LIMIT / MARKET ====================
 
-  public async closePositionByLimit(symbol: string): Promise<void> {
+  public async closePositionByLimit(
+    symbol: string
+  ): Promise<{ side: 'long' | 'short'; price: number } | null> {
     const state = await this.getPositions();
     const position = this.findPosition(state, symbol);
 
     if (!position) {
       console.log(`  ℹ️ No open position for ${symbol} to close`);
-      return;
+      return null;
     }
 
     await this.getBaseLotsDecimals(symbol);
     const baseUnits = this.lotsToBaseUnits(Math.abs(Number(position.basePositionLots)), symbol);
     const closeSide = Number(position.basePositionLots) > 0 ? 'short' : 'long';
 
-    console.log(`  📋 Closing ${symbol} via LIMIT | ${closeSide.toUpperCase()} | ${parseFloat(baseUnits.toFixed(6))} ${symbol}`);
+    console.log(`  📋 ${shortAddr(this.walletAddress)} | Closing ${symbol} via LIMIT | ${closeSide.toUpperCase()} | ${parseFloat(baseUnits.toFixed(6))} ${symbol}`);
 
-    await this.placePositionOrder({
+    const { orderPrice } = await this.placePositionOrder({
       instrument: symbol,
       executionSide: closeSide as 'long' | 'short',
       executionType: 'limit',
@@ -716,6 +718,8 @@ export class PhoenixService {
       overrideBaseUnits: baseUnits,
       reduceOnly: true,
     });
+
+    return { side: closeSide as 'long' | 'short', price: orderPrice ?? 0 };
   }
 
   public async closePositionByMarket(symbol: string): Promise<void> {
@@ -731,7 +735,7 @@ export class PhoenixService {
     const baseUnits = this.lotsToBaseUnits(Math.abs(Number(position.basePositionLots)), symbol);
     const closeSide = Number(position.basePositionLots) > 0 ? 'short' : 'long';
 
-    console.log(`  🚀 Closing ${symbol} via MARKET | ${closeSide.toUpperCase()} | ${parseFloat(baseUnits.toFixed(6))} ${symbol}`);
+    console.log(`  🚀 ${shortAddr(this.walletAddress)} | Closing ${symbol} via MARKET | ${closeSide.toUpperCase()} | ${parseFloat(baseUnits.toFixed(6))} ${symbol}`);
 
     await this.placePositionOrder({
       instrument: symbol,
@@ -757,6 +761,67 @@ export class PhoenixService {
     const askLiquidity = orderbook.asks.slice(0, 5).reduce((sum, [, size]) => sum + size, 0);
 
     return { midPrice, bestBid, bestAsk, spreadPercent, bidLiquidity, askLiquidity };
+  }
+
+  /** Глубина стакана (base units) в пределах слиппеджа от лучшей цены:
+   * для покупки суммируем аски до bestAsk*(1+p), для продажи — биды до bestBid*(1-p). */
+  public async getBookDepth(
+    symbol: string,
+    side: 'buy' | 'sell',
+    maxSlippagePercent: number
+  ): Promise<number> {
+    const orderbook = await this.apiClient.getOrderbook(symbol);
+    const bestBid = orderbook.bids[0]?.[0] ?? 0;
+    const bestAsk = orderbook.asks[0]?.[0] ?? 0;
+    const fraction = Math.max(0, maxSlippagePercent) / 100;
+
+    if (side === 'buy') {
+      const limit = bestAsk * (1 + fraction);
+      return orderbook.asks
+        .filter(([price]) => price <= limit)
+        .reduce((sum, [, size]) => sum + size, 0);
+    }
+    const limit = bestBid * (1 - fraction);
+    return orderbook.bids
+      .filter(([price]) => price >= limit)
+      .reduce((sum, [, size]) => sum + size, 0);
+  }
+
+  /** Расходы последнего цикла по символу: комиссии + funding.
+   * Старт цикла ищем в истории филлов: новейший филл с baseLotsBefore == 0 —
+   * это открытие позиции из флэта; суммируем всё с этого момента.
+   * Работает и для открытой, и для только что закрытой позиции. */
+  public async getLastCycleCosts(symbol: string): Promise<{ fees: number; funding: number }> {
+    const fills = await this.apiClient.getTraderTradesHistory(
+      this.walletAddress,
+      { marketSymbol: symbol, limit: 100 }
+    );
+    const toMs = (t: string | number): number => (typeof t === 'number' ? t : Date.parse(t));
+    const sorted = [...fills.data].sort((a, b) => toMs(a.timestamp) - toMs(b.timestamp));
+
+    let since: number | null = null;
+    for (let i = sorted.length - 1; i >= 0; i--) {
+      if (parseFloat(sorted[i]!.baseLotsBefore) === 0) {
+        since = toMs(sorted[i]!.timestamp);
+        break;
+      }
+    }
+    since ??= sorted.length > 0 ? toMs(sorted[0]!.timestamp) : null;
+    if (since === null) return { fees: 0, funding: 0 };
+
+    const fees = sorted
+      .filter((f) => toMs(f.timestamp) >= since!)
+      .reduce((sum, f) => sum + Math.abs(parseFloat(f.fees) || 0), 0);
+
+    const funding = await this.apiClient.getTraderFundingHistory(
+      this.walletAddress,
+      { symbol, limit: 100 }
+    );
+    const fundingSum = funding.events
+      .filter((e) => toMs(e.timestamp) >= since!)
+      .reduce((sum, e) => sum + (parseFloat(e.fundingPayment) || 0), 0);
+
+    return { fees, funding: fundingSum };
   }
 
   public async waitForSpread(
@@ -1041,8 +1106,8 @@ export class PhoenixService {
     const displayPrice = orderPrice ?? midPrice;
     const priceLabel = orderPrice === undefined ? 'MARKET' : `$${orderPrice.toFixed(2)}`;
     console.log(
-      `  ✅ ${executionSide.toUpperCase()} | ${quantity.toFixed(2)} ${instrument} | ` +
-      `${priceLabel} | $${(quantity * displayPrice).toFixed(2)}`
+      `  ✅ ${shortAddr(this.walletAddress)} | ${executionSide.toUpperCase()} | ` +
+      `${quantity.toFixed(2)} ${instrument} | ${priceLabel} | $${(quantity * displayPrice).toFixed(2)}`
     );
 
     return { rfqId: txHash, orderPrice, makerReferencePrice };

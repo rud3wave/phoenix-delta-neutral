@@ -5,9 +5,12 @@
 // close-all (mode 2) so the close logic never drifts apart.
 // Обе стороны одновременно ставят закрывающие лимитки на тач
 // (мейкер) и переставляют незаполненные каждые REQUOTE_INTERVAL_SEC.
-// Если одна сторона закрылась полностью, а вторая отстаёт дольше
-// ONE_SIDED_CLOSE_TIMEOUT_SEC — отстающая закрывается маркетом,
-// чтобы не стоять голым.
+// Между перестановками лимитки держатся первыми в стакане: каждые
+// TOP_OF_BOOK_CHECK_SEC проверяем верх стакана и, если цена ушла выше
+// нашей покупки (или ниже нашей продажи), ордер сразу переставляется
+// на лучший бид/аск. Если одна сторона закрылась полностью, а вторая
+// отстаёт дольше ONE_SIDED_CLOSE_TIMEOUT_SEC — отстающая закрывается
+// маркетом, чтобы не стоять голым.
 // ============================================================
 
 import {
@@ -15,6 +18,7 @@ import {
   FILL_POLL_INTERVAL_MS,
   ONE_SIDED_CLOSE_TIMEOUT_SEC,
   REQUOTE_INTERVAL_SEC,
+  TOP_OF_BOOK_CHECK_SEC,
 } from '../settings.js';
 import { PhoenixService } from './phoenix-service.js';
 import { sleep, shortAddr } from './utils.js';
@@ -22,6 +26,14 @@ import { sleep, shortAddr } from './utils.js';
 export interface CloseAccount {
   service: PhoenixService;
 }
+
+/** Куда и по какой цене поставлена закрывающая лимитка аккаунта. */
+interface OrderInfo {
+  side: 'long' | 'short';
+  price: number;
+}
+
+const PRICE_EPS = 1e-9;
 
 /** Маркет-закрытие с ретраями: транзитентная ошибка не должна оставлять позицию открытой. */
 async function closeByMarketWithRetry(acc: CloseAccount, symbol: string, attempts = 3): Promise<void> {
@@ -38,25 +50,69 @@ async function closeByMarketWithRetry(acc: CloseAccount, symbol: string, attempt
   throw lastError;
 }
 
-async function placeLimits(accounts: Iterable<CloseAccount>, symbol: string): Promise<void> {
+async function placeLimits(
+  accounts: Iterable<CloseAccount>,
+  symbol: string,
+  orderInfo: Map<CloseAccount, OrderInfo>
+): Promise<void> {
   await Promise.all([...accounts].map(async (acc) => {
     try {
-      await acc.service.closePositionByLimit(symbol);
+      const placed = await acc.service.closePositionByLimit(symbol);
+      if (placed) orderInfo.set(acc, placed);
     } catch (e: any) {
       console.log(`  ⚠️ Limit close failed for ${shortAddr(acc.service.getAddress())}: ${e.message}`);
     }
   }));
 }
 
-async function rePlace(accounts: Iterable<CloseAccount>, symbol: string): Promise<void> {
+async function rePlace(
+  accounts: Iterable<CloseAccount>,
+  symbol: string,
+  orderInfo: Map<CloseAccount, OrderInfo>
+): Promise<void> {
   await Promise.all([...accounts].map(async (acc) => {
     try {
       await acc.service.cancelAllOrders(symbol);
-      await acc.service.closePositionByLimit(symbol);
+      const placed = await acc.service.closePositionByLimit(symbol);
+      if (placed) orderInfo.set(acc, placed);
     } catch (e: any) {
       console.log(`  ⚠️ Re-place failed for ${shortAddr(acc.service.getAddress())}: ${e.message}`);
     }
   }));
+}
+
+/** Лимитка должна стоять первой в стакане: если рынок ушёл и ордер
+ * оказался ниже верха (для покупки) или выше (для продажи) — снимаем
+ * и переставляем на лучший бид/аск. */
+async function maintainTopOfBook(
+  pending: Set<CloseAccount>,
+  symbol: string,
+  orderInfo: Map<CloseAccount, OrderInfo>
+): Promise<void> {
+  if (pending.size === 0) return;
+
+  const reader = [...pending][0]!;
+  let bestBid: number;
+  let bestAsk: number;
+  try {
+    const snap = await reader.service.getMarketSnapshot(symbol);
+    bestBid = snap.bestBid;
+    bestAsk = snap.bestAsk;
+  } catch {
+    return;
+  }
+
+  const behind = [...pending].filter((acc) => {
+    const info = orderInfo.get(acc);
+    if (!info || info.price <= 0) return false;
+    return info.side === 'long'
+      ? bestBid > info.price + PRICE_EPS
+      : bestAsk < info.price - PRICE_EPS;
+  });
+  if (behind.length === 0) return;
+
+  console.log(`  ⬆️ ${behind.length} limit(s) off the top of the book — re-placing at best...`);
+  await rePlace(behind, symbol, orderInfo);
 }
 
 async function cancelAll(accounts: CloseAccount[], symbol: string): Promise<void> {
@@ -77,16 +133,19 @@ async function marketCloseAll(accounts: CloseAccount[], symbol: string): Promise
   }));
 }
 
-/** Один раунд быстрого опроса позиций (параллельно), строго до deadline. */
+/** Один раунд быстрого опроса позиций (параллельно), строго до deadline.
+ * Параллельно следит, чтобы лимитки оставались первыми в стакане. */
 async function pollRound(
   pending: Set<CloseAccount>,
   symbol: string,
   deadline: number,
-  onFilled: (acc: CloseAccount) => void
+  onFilled: (acc: CloseAccount) => void,
+  orderInfo: Map<CloseAccount, OrderInfo>
 ): Promise<void> {
   const pollSec = FILL_POLL_INTERVAL_MS / 1000;
   const roundStart = Date.now();
   let lastLogAt = 0;
+  let lastTopCheckAt = 0;
 
   while (pending.size > 0 && Date.now() < deadline) {
     await sleep(pollSec);
@@ -107,6 +166,11 @@ async function pollRound(
     }
 
     const now = Date.now();
+    if (pending.size > 0 && now - lastTopCheckAt >= TOP_OF_BOOK_CHECK_SEC * 1000) {
+      lastTopCheckAt = now;
+      await maintainTopOfBook(pending, symbol, orderInfo);
+    }
+
     if (pending.size > 0 && now - lastLogAt >= 15_000) {
       lastLogAt = now;
       console.log(
@@ -154,7 +218,8 @@ export async function closeLeaderFollower(
   if (limitAccounts.length === 0 || marketAccounts.length === 0) {
     console.log(`\n  📋 Closing ${all.length} ${symbol} residual via LIMIT (maker)...`);
     const pendingClose = new Set(all);
-    await placeLimits(pendingClose, symbol);
+    const orderInfo = new Map<CloseAccount, OrderInfo>();
+    await placeLimits(pendingClose, symbol, orderInfo);
 
     let closeRetryCount = 0;
     while (pendingClose.size > 0) {
@@ -165,7 +230,7 @@ export async function closeLeaderFollower(
       );
       await pollRound(pendingClose, symbol, roundDeadline, (acc) => {
         console.log(`  ✅ ${shortAddr(acc.service.getAddress())} closed via LIMIT (maker)`);
-      });
+      }, orderInfo);
 
       if (pendingClose.size === 0) break;
 
@@ -176,7 +241,7 @@ export async function closeLeaderFollower(
       }
 
       console.log(`  🔄 ${pendingClose.size} limit(s) unfilled — cancelling & re-placing (attempt ${closeRetryCount})...`);
-      await rePlace(pendingClose, symbol);
+      await rePlace(pendingClose, symbol, orderInfo);
     }
 
     await cancelAll(all, symbol);
@@ -190,7 +255,8 @@ export async function closeLeaderFollower(
     `${limitAccounts.length} + ${marketAccounts.length} ${symbol}...`
   );
   const pending = new Set(all);
-  await placeLimits(pending, symbol);
+  const orderInfo = new Map<CloseAccount, OrderInfo>();
+  await placeLimits(pending, symbol, orderInfo);
 
   let closeRetryCount = 0;
   let oneSidedSince: number | null = null;
@@ -202,7 +268,7 @@ export async function closeLeaderFollower(
 
     await pollRound(pending, symbol, roundDeadline, (acc) => {
       console.log(`  ✅ ${shortAddr(acc.service.getAddress())} closed via LIMIT (maker)`);
-    });
+    }, orderInfo);
 
     if (pending.size === 0) break;
 
@@ -229,7 +295,7 @@ export async function closeLeaderFollower(
     }
 
     console.log(`  🔄 ${pending.size} limit(s) unfilled — cancelling & re-placing (attempt ${closeRetryCount})...`);
-    await rePlace(pending, symbol);
+    await rePlace(pending, symbol, orderInfo);
   }
 
   await cancelAll(all, symbol);

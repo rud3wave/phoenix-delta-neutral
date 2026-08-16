@@ -219,6 +219,9 @@ async function closeAllPositions(services: PhoenixService[]): Promise<void> {
   const lines: string[] = ['📂 POSITIONS CLOSED | Force close', ''];
   let totalPnl = 0;
   let totalVolume = 0;
+  let totalFees = 0;
+  let totalFunding = 0;
+  let costsSeen = 0;
 
   for (const s of snapshot) {
     if (s.error) {
@@ -230,6 +233,17 @@ async function closeAllPositions(services: PhoenixService[]): Promise<void> {
       const pnl = balanceAfter - s.balanceBefore;
       totalPnl += pnl;
       totalVolume += s.volume;
+
+      for (const sym of new Set(s.positions.map((p) => p.symbol))) {
+        try {
+          const costs = await s.service.getLastCycleCosts(sym);
+          totalFees += costs.fees;
+          totalFunding += costs.funding;
+          costsSeen++;
+        } catch {
+          // non-critical
+        }
+      }
 
       if (s.side) {
         const emoji = s.side === 'long' ? '🟢' : '🔴';
@@ -258,6 +272,10 @@ async function closeAllPositions(services: PhoenixService[]): Promise<void> {
   lines.push('');
   lines.push(`${totalEmoji} Total PnL: ${pnlSign}${totalPnl.toFixed(4)}$`);
   lines.push(`💰 Total Volume: $${totalVolume.toFixed(2)}`);
+  if (costsSeen > 0) {
+    const fundingSign = totalFunding >= 0 ? '+' : '';
+    lines.push(`💸 Fees: -${totalFees.toFixed(4)}$ | Funding: ${fundingSign}${totalFunding.toFixed(4)}$`);
+  }
   lines.push(` Cost per 100k: ${costPer100k.toFixed(3)}$`);
 
   console.log('\n✅ Close-all complete');

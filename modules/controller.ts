@@ -21,6 +21,7 @@ import {
   EXECUTION_MODE,
   FILL_POLL_INTERVAL_MS,
   REQUOTE_INTERVAL_SEC,
+  SLIPPAGE,
 } from '../settings.js';
 import { distributeWithCaps, sideNotionalBounds } from './allocation.js';
 import { PhoenixService } from './phoenix-service.js';
@@ -518,6 +519,20 @@ export class DeltaNeutralController {
         }
       }
 
+      let totalFees = 0;
+      let totalFunding = 0;
+      let costsSeen = 0;
+      for (const acc of accounts) {
+        try {
+          const costs = await acc.service.getLastCycleCosts(srcToken);
+          totalFees += costs.fees;
+          totalFunding += costs.funding;
+          costsSeen++;
+        } catch {
+          // non-critical
+        }
+      }
+
       const costPer100k = totalVolume > 0 ? (-totalPnl / totalVolume) * 100000 : 0;
       const pnlSign = totalPnl >= 0 ? '+' : '';
       const totalEmoji = totalPnl >= 0 ? '📈' : '📉';
@@ -525,6 +540,10 @@ export class DeltaNeutralController {
       lines.push('');
       lines.push(`${totalEmoji} Total PnL: ${pnlSign}${totalPnl.toFixed(4)}$`);
       lines.push(`💰 Total Volume: $${totalVolume.toFixed(2)}`);
+      if (costsSeen > 0) {
+        const fundingSign = totalFunding >= 0 ? '+' : '';
+        lines.push(`💸 Fees: -${totalFees.toFixed(4)}$ | Funding: ${fundingSign}${totalFunding.toFixed(4)}$`);
+      }
       lines.push(` Cost per 100k: ${costPer100k.toFixed(3)}$`);
 
       await sendTg(lines.join('\n'));
@@ -671,6 +690,8 @@ export class DeltaNeutralController {
     // Follower places MARKET orders (parallel, exact lot matching).
     // Ошибка фолловера недопустима: группа осталась бы односторонней,
     // поэтому ретраим, а при полном провале откатываем ногу лидера.
+    await this.waitForBookRecovery(srcToken, marketSide, totalLimitBaseUnits, marketAccounts[0]!);
+
     console.log(`\n  🚀 ${marketSide.toUpperCase()} placing MARKET orders (delta-matched)...`);
     if (isTradingHalted()) throw new Error('Trading halted by Force Close');
 
@@ -703,5 +724,40 @@ export class DeltaNeutralController {
         `${failedFollowers.length} follower(s) failed to open after retries — unwinding leader side`
       );
     }
+  }
+
+  /** После филла лидера в стакане дыра на его стороне: маркеты фолловеров
+   * умирают об тонкий стакан (IOC min-fill) и конкурируют друг с другом.
+   * Ждём, пока глубина в пределах слиппеджа восстановится до суммарного
+   * объёма фолловеров (не дольше таймаута), затем бьём маркетом. */
+  private async waitForBookRecovery(
+    srcToken: string,
+    marketSide: 'long' | 'short',
+    requiredUnits: number,
+    reader: GroupAccount,
+    timeoutSec = 10
+  ): Promise<void> {
+    const deadline = Date.now() + timeoutSec * 1000;
+    const buy = marketSide === 'long';
+    let logged = false;
+
+    while (Date.now() < deadline) {
+      if (isTradingHalted()) throw new Error('Trading halted by Force Close');
+      try {
+        const depth = await reader.service.getBookDepth(srcToken, buy ? 'buy' : 'sell', SLIPPAGE);
+        if (depth >= requiredUnits) return;
+        if (!logged) {
+          logged = true;
+          console.log(
+            `  ⏳ Book thin after leader fill ` +
+            `(${depth.toFixed(2)}/${requiredUnits.toFixed(2)} ${srcToken} within slippage) — waiting for recovery...`
+          );
+        }
+      } catch {
+        return; // не удалось прочитать стакан — ретраи фолловеров подстрахуют
+      }
+      await sleep(1);
+    }
+    console.log(`  ⚠️ Book still thin after ${timeoutSec}s — placing follower markets anyway`);
   }
 }

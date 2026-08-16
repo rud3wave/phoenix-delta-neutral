@@ -21,7 +21,7 @@ import {
   TOP_OF_BOOK_CHECK_SEC,
 } from '../settings.js';
 import { PhoenixService } from './phoenix-service.js';
-import { sleep, shortAddr } from './utils.js';
+import { sleep, shortAddr, shortError } from './utils.js';
 
 export interface CloseAccount {
   service: PhoenixService;
@@ -34,6 +34,9 @@ interface OrderInfo {
 }
 
 const PRICE_EPS = 1e-9;
+
+/** Как часто повторять постановку, если закрывающая лимитка не встала после ошибки. */
+const MISSING_ORDER_RETRY_SEC = 15;
 
 /** Маркет-закрытие с ретраями: транзитентная ошибка не должна оставлять позицию открытой. */
 async function closeByMarketWithRetry(acc: CloseAccount, symbol: string, attempts = 3): Promise<void> {
@@ -60,7 +63,7 @@ async function placeLimits(
       const placed = await acc.service.closePositionByLimit(symbol);
       if (placed) orderInfo.set(acc, placed);
     } catch (e: any) {
-      console.log(`  ⚠️ Limit close failed for ${shortAddr(acc.service.getAddress())}: ${e.message}`);
+      console.log(`  ⚠️ Limit close failed for ${shortAddr(acc.service.getAddress())}: ${shortError(e)}`);
     }
   }));
 }
@@ -76,18 +79,20 @@ async function rePlace(
       const placed = await acc.service.closePositionByLimit(symbol);
       if (placed) orderInfo.set(acc, placed);
     } catch (e: any) {
-      console.log(`  ⚠️ Re-place failed for ${shortAddr(acc.service.getAddress())}: ${e.message}`);
+      console.log(`  ⚠️ Re-place failed for ${shortAddr(acc.service.getAddress())}: ${shortError(e)}`);
     }
   }));
 }
 
 /** Лимитка должна стоять первой в стакане: если рынок ушёл и ордер
  * оказался ниже верха (для покупки) или выше (для продажи) — снимаем
- * и переставляем на лучший бид/аск. */
+ * и переставляем на лучший бид/аск. Лимитки, которые не встали после ошибки
+ * постановки, повторяем каждые MISSING_ORDER_RETRY_SEC. */
 async function maintainTopOfBook(
   pending: Set<CloseAccount>,
   symbol: string,
-  orderInfo: Map<CloseAccount, OrderInfo>
+  orderInfo: Map<CloseAccount, OrderInfo>,
+  placeRetry: Map<CloseAccount, number>
 ): Promise<void> {
   if (pending.size === 0) return;
 
@@ -102,16 +107,21 @@ async function maintainTopOfBook(
     return;
   }
 
+  const now = Date.now();
   const behind = [...pending].filter((acc) => {
     const info = orderInfo.get(acc);
-    if (!info || info.price <= 0) return false;
+    if (!info || info.price <= 0) {
+      // лимитка не встала после ошибки постановки — повторяем с откатом
+      return now - (placeRetry.get(acc) ?? 0) >= MISSING_ORDER_RETRY_SEC * 1000;
+    }
     return info.side === 'long'
       ? bestBid > info.price + PRICE_EPS
       : bestAsk < info.price - PRICE_EPS;
   });
   if (behind.length === 0) return;
 
-  console.log(`  ⬆️ ${behind.length} limit(s) off the top of the book — re-placing at best...`);
+  for (const acc of behind) placeRetry.set(acc, now);
+  console.log(`  ⬆️ ${behind.length} limit(s) missing or off the top of the book — re-placing at best...`);
   await rePlace(behind, symbol, orderInfo);
 }
 
@@ -128,7 +138,7 @@ async function marketCloseAll(accounts: CloseAccount[], symbol: string): Promise
       await closeByMarketWithRetry(acc, symbol);
       console.log(`  ✅ ${shortAddr(acc.service.getAddress())} closed via MARKET (fallback)`);
     } catch (e: any) {
-      console.log(`  ❌ Market close failed for ${shortAddr(acc.service.getAddress())}: ${e.message}`);
+      console.log(`  ❌ Market close failed for ${shortAddr(acc.service.getAddress())}: ${shortError(e)}`);
     }
   }));
 }
@@ -140,7 +150,8 @@ async function pollRound(
   symbol: string,
   deadline: number,
   onFilled: (acc: CloseAccount) => void,
-  orderInfo: Map<CloseAccount, OrderInfo>
+  orderInfo: Map<CloseAccount, OrderInfo>,
+  placeRetry: Map<CloseAccount, number>
 ): Promise<void> {
   const pollSec = FILL_POLL_INTERVAL_MS / 1000;
   const roundStart = Date.now();
@@ -168,7 +179,7 @@ async function pollRound(
     const now = Date.now();
     if (pending.size > 0 && now - lastTopCheckAt >= TOP_OF_BOOK_CHECK_SEC * 1000) {
       lastTopCheckAt = now;
-      await maintainTopOfBook(pending, symbol, orderInfo);
+      await maintainTopOfBook(pending, symbol, orderInfo, placeRetry);
     }
 
     if (pending.size > 0 && now - lastLogAt >= 15_000) {
@@ -202,7 +213,7 @@ export async function closeLeaderFollower(
         await closeByMarketWithRetry(acc, symbol);
         console.log(`  ✅ ${shortAddr(acc.service.getAddress())} closed via MARKET`);
       } catch (e: any) {
-        console.log(`  ❌ Market close failed for ${shortAddr(acc.service.getAddress())}: ${e.message}`);
+        console.log(`  ❌ Market close failed for ${shortAddr(acc.service.getAddress())}: ${shortError(e)}`);
       }
     }));
     console.log(`  ✅ ${symbol} closed (all-market)`);
@@ -219,6 +230,7 @@ export async function closeLeaderFollower(
     console.log(`\n  📋 Closing ${all.length} ${symbol} residual via LIMIT (maker)...`);
     const pendingClose = new Set(all);
     const orderInfo = new Map<CloseAccount, OrderInfo>();
+    const placeRetry = new Map<CloseAccount, number>();
     await placeLimits(pendingClose, symbol, orderInfo);
 
     let closeRetryCount = 0;
@@ -230,7 +242,7 @@ export async function closeLeaderFollower(
       );
       await pollRound(pendingClose, symbol, roundDeadline, (acc) => {
         console.log(`  ✅ ${shortAddr(acc.service.getAddress())} closed via LIMIT (maker)`);
-      }, orderInfo);
+      }, orderInfo, placeRetry);
 
       if (pendingClose.size === 0) break;
 
@@ -256,6 +268,7 @@ export async function closeLeaderFollower(
   );
   const pending = new Set(all);
   const orderInfo = new Map<CloseAccount, OrderInfo>();
+  const placeRetry = new Map<CloseAccount, number>();
   await placeLimits(pending, symbol, orderInfo);
 
   let closeRetryCount = 0;
@@ -268,7 +281,7 @@ export async function closeLeaderFollower(
 
     await pollRound(pending, symbol, roundDeadline, (acc) => {
       console.log(`  ✅ ${shortAddr(acc.service.getAddress())} closed via LIMIT (maker)`);
-    }, orderInfo);
+    }, orderInfo, placeRetry);
 
     if (pending.size === 0) break;
 

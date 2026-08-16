@@ -18,6 +18,41 @@ export function sideNotionalBounds(balances: number[], range: LeverageRange): { 
 }
 
 /**
+ * Дозагрузка поверх открытых позиций: итоговый notional кошелька (старый +
+ * новый) остаётся в [balance*min, balance*max], а обе стороны сводятся к
+ * одному итогу finalTotal — дельта-нейтрально ВМЕСТЕ со старыми позициями.
+ * Возвращает null, если вилка недостижима (старые позиции вне диапазона).
+ */
+export function planTopUp(
+  longSide: Array<{ balance: number; existing: number }>,
+  shortSide: Array<{ balance: number; existing: number }>,
+  range: LeverageRange
+): { longs: number[]; shorts: number[]; finalTotal: number } | null {
+  const capsOf = (side: Array<{ balance: number; existing: number }>) =>
+    side.map((w) => ({
+      min: Math.max(0, w.balance * range.min - w.existing),
+      max: Math.max(0, w.balance * range.max - w.existing),
+    }));
+  const capsL = capsOf(longSide);
+  const capsS = capsOf(shortSide);
+  const existL = longSide.reduce((s, w) => s + w.existing, 0);
+  const existS = shortSide.reduce((s, w) => s + w.existing, 0);
+
+  const sum = (caps: Array<{ min: number; max: number }>, f: (c: { min: number; max: number }) => number) =>
+    caps.reduce((s, c) => s + f(c), 0);
+  const lo = Math.max(existL + sum(capsL, (c) => c.min), existS + sum(capsS, (c) => c.min));
+  const hi = Math.min(existL + sum(capsL, (c) => c.max), existS + sum(capsS, (c) => c.max));
+  if (lo > hi + 1e-9) return null;
+
+  const finalTotal = lo + Math.random() * (hi - lo);
+  return {
+    longs: distributeWithCaps(finalTotal - existL, capsL),
+    shorts: distributeWithCaps(finalTotal - existS, capsS),
+    finalTotal,
+  };
+}
+
+/**
  * Разбивает total на части по caps: part_i ∈ [min_i, max_i], сумма — точно total.
  *
  * Рандом с look-ahead: кошелёк получает случайную долю, но хвосту всегда

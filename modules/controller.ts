@@ -23,7 +23,7 @@ import {
   REQUOTE_INTERVAL_SEC,
   SLIPPAGE,
 } from '../settings.js';
-import { distributeWithCaps, sideNotionalBounds } from './allocation.js';
+import { planTopUp } from './allocation.js';
 import { PhoenixService } from './phoenix-service.js';
 import { closeLeaderFollower } from './close-strategy.js';
 import { isTradingHalted } from './runtime-control.js';
@@ -35,6 +35,7 @@ import {
   isRangeEmpty,
   shuffleArray,
   shortAddr,
+  shortError,
   isNetworkError,
 } from './utils.js';
 
@@ -52,6 +53,9 @@ interface GroupAccount {
   side?: 'long' | 'short';
   orderAmount?: number;
   leverage?: number;
+  existingSide: 'long' | 'short' | null;
+  existingUnits: number;
+  existingNotional: number;
   failures: number;
   proxyRotations: number;
   tradesCompleted: number;
@@ -63,6 +67,8 @@ interface ActiveGroup {
   accounts: GroupAccount[];
   srcToken: string;
   groupConfig: readonly number[];
+  /** В этом цикле реально открывались новые ордера — тогда при ошибке нужна cleanup-развязка. */
+  opened?: boolean;
 }
 
 // ==================== CONTROLLER ====================
@@ -86,6 +92,9 @@ export class DeltaNeutralController {
       balance,
       balanceBefore: balance,
       balanceAfter: 0,
+      existingSide: null,
+      existingUnits: 0,
+      existingNotional: 0,
       failures: 0,
       proxyRotations: 0,
       tradesCompleted: 0,
@@ -152,42 +161,12 @@ export class DeltaNeutralController {
           break;
         }
 
-        // Pick a random group config
-        const groupConfig = GROUP_CONFIGS[Math.floor(Math.random() * GROUP_CONFIGS.length)]!;
-        const [sideACount, sideBCount] = groupConfig;
-        const groupSize = sideACount + sideBCount;
+        // Токен выбираем ДО группы: стороны кошельков фиксируются по открытым позициям
+        const srcToken = TOKENS_TO_TRADE[Math.floor(Math.random() * TOKENS_TO_TRADE.length)]!;
 
-        if (this.pool.length < groupSize) {
-          // Check if ANY config can be satisfied
-          const canFormGroup = GROUP_CONFIGS.some(([a, b]) => this.pool.length >= a + b);
-          if (!canFormGroup) {
-            console.log(`\n⚠️ Not enough wallets for any group config (have ${this.pool.length}). Stopping.`);
-            break;
-          }
-          console.log(`  ⏳ Not enough wallets for group [${sideACount},${sideBCount}] (need ${groupSize}, have ${this.pool.length}). Waiting...`);
-          await sleep(10);
-          continue;
-        }
-
-        // Smart group formation: sort by balance, give larger wallets to smaller side
-        const sortedPool = [...this.pool].sort((a, b) => b.balance - a.balance);
-        const smallerSideCount = Math.min(sideACount, sideBCount);
-        const largerSideCount = Math.max(sideACount, sideBCount);
-
-        // Top balances → smaller side (they carry more notional per wallet)
-        const smallerSideAccounts = sortedPool.slice(0, smallerSideCount);
-        // Remaining → shuffle and pick for larger side
-        const restPool = sortedPool.slice(smallerSideCount);
-        const shuffledRest = shuffleArray(restPool);
-        const largerSideAccounts = shuffledRest.slice(0, largerSideCount);
-        const remaining = shuffledRest.slice(largerSideCount);
-
-        // Порядок не важен: стороны назначает calculateAllocation по балансам
-        const selected = [...smallerSideAccounts, ...largerSideAccounts];
-
-        // Refresh balances
-        console.log('\n  🔄 Refreshing balances...');
-        for (const acc of selected) {
+        // Refresh balances + existing positions for the whole pool
+        console.log(`\n  🔄 Refreshing balances & ${srcToken} positions...`);
+        for (const acc of this.pool) {
           try {
             acc.balance = await acc.service.getUsdcBalance();
             acc.balanceBefore = acc.balance;
@@ -200,7 +179,58 @@ export class DeltaNeutralController {
               acc.balance = 0;
             }
           }
+          try {
+            const pos = await acc.service.getPositionWithLiquidation(srcToken);
+            acc.existingSide = pos.hasPosition ? pos.side : null;
+            acc.existingUnits = pos.hasPosition ? pos.quantity : 0;
+            acc.existingNotional = pos.hasPosition ? pos.positionUsd : 0;
+          } catch {
+            acc.existingSide = null;
+            acc.existingUnits = 0;
+            acc.existingNotional = 0;
+          }
         }
+
+        // Группа обязана забрать ВСЕ открытые позиции — конфиг подбирается под них
+        const longPos = this.pool.filter((a) => a.existingSide === 'long');
+        const shortPos = this.pool.filter((a) => a.existingSide === 'short');
+        const noPos = this.pool.filter((a) => a.existingSide === null);
+        const feasible = GROUP_CONFIGS.filter(([lc, sc]) =>
+          lc >= longPos.length &&
+          sc >= shortPos.length &&
+          (lc - longPos.length) + (sc - shortPos.length) <= noPos.length
+        );
+        if (feasible.length === 0) {
+          console.log(
+            `\n⚠️ Open positions (${longPos.length}L/${shortPos.length}S) don't fit any group config — ` +
+            `close via mode 2. Waiting...`
+          );
+          await sleep(10);
+          continue;
+        }
+        const groupConfig = feasible[Math.floor(Math.random() * feasible.length)]!;
+        const [longCount, shortCount] = groupConfig;
+
+        // Стороны позиций фиксированы; свободные слоты заполняют кошельки без позиций:
+        // крупные балансы — меньшей стороне (они несут больше notional на кошелёк)
+        const sortedNoPos = [...noPos].sort((a, b) => b.balance - a.balance);
+        const needL = longCount - longPos.length;
+        const needS = shortCount - shortPos.length;
+        const minorityFirst = needL <= needS;
+        const firstNeed = minorityFirst ? needL : needS;
+        const secondNeed = minorityFirst ? needS : needL;
+        const firstSide: 'long' | 'short' = minorityFirst ? 'long' : 'short';
+        const secondSide: 'long' | 'short' = minorityFirst ? 'short' : 'long';
+        const firstFillers = sortedNoPos.slice(0, firstNeed);
+        const secondFillers = shuffleArray(sortedNoPos.slice(firstNeed)).slice(0, secondNeed);
+        const remaining = sortedNoPos.filter(
+          (a) => !firstFillers.includes(a) && !secondFillers.includes(a)
+        );
+        for (const acc of longPos) acc.side = 'long';
+        for (const acc of shortPos) acc.side = 'short';
+        for (const acc of firstFillers) acc.side = firstSide;
+        for (const acc of secondFillers) acc.side = secondSide;
+        const selected = [...longPos, ...firstFillers, ...shortPos, ...secondFillers];
 
         // Validate balances are sufficient (need at least $1 to trade)
         const canCover = selected.every((acc) => acc.balance >= 1);
@@ -211,9 +241,6 @@ export class DeltaNeutralController {
           continue;
         }
 
-        // Pick token
-        const srcToken = TOKENS_TO_TRADE[Math.floor(Math.random() * TOKENS_TO_TRADE.length)]!;
-
         const groupId = String(this.nextGroupId++);
         const group: ActiveGroup = {
           id: groupId,
@@ -223,7 +250,7 @@ export class DeltaNeutralController {
         };
 
         console.log(`\n${'='.repeat(60)}`);
-        console.log(`📦 Group ${groupId} | ${srcToken} | Config: [${sideACount}L, ${sideBCount}S]`);
+        console.log(`📦 Group ${groupId} | ${srcToken} | Config: [${longCount}L, ${shortCount}S]`);
         console.log(`${'='.repeat(60)}`);
 
         // Execute strategy
@@ -237,7 +264,7 @@ export class DeltaNeutralController {
           await sleepByRange(DELAY_BETWEEN_TRADES, 'Delay between cycles');
         }
       } catch (e: any) {
-        console.log(`\n❌ Controller error: ${e.message}`);
+        console.log(`\n❌ Controller error: ${shortError(e)}`);
         await sleep(5);
       }
     }
@@ -250,8 +277,7 @@ export class DeltaNeutralController {
   // ==================== STRATEGY EXECUTION ====================
 
   private async executeStrategy(group: ActiveGroup): Promise<void> {
-    const { srcToken, accounts, groupConfig } = group;
-    const [longCount] = groupConfig;
+    const { srcToken, accounts } = group;
 
     try {
       // Step 1: Wait for acceptable spread
@@ -260,8 +286,8 @@ export class DeltaNeutralController {
         srcToken, maxSpread, POLL_INTERVAL_SEC, 180
       );
 
-      // Step 2: Calculate position allocation
-      this.calculateAllocation(accounts, longCount, srcToken);
+      // Step 2: Calculate top-up allocation (existing positions included)
+      this.calculateAllocation(accounts, srcToken);
 
       const longAccounts = accounts.filter((a) => a.side === 'long');
       const shortAccounts = accounts.filter((a) => a.side === 'short');
@@ -280,21 +306,26 @@ export class DeltaNeutralController {
 
       console.log(`\n  ✅ Group ${group.id} cycle completed`);
     } catch (e: any) {
-      console.log(`\n  ❌ Strategy failed: ${e.message}`);
-      console.log('  🚨 Closing positions: leader LIMIT → follower MARKET...');
-      try {
-        // Та же схема, что и штатное закрытие: лидер — лимитки, вторая сторона — маркет
-        const biggest = [...accounts].sort((a, b) => (b.orderAmount ?? 0) - (a.orderAmount ?? 0))[0];
-        const limitSide = biggest?.side ?? 'long';
-        const marketSide = limitSide === 'long' ? 'short' : 'long';
-        await closeLeaderFollower(
-          accounts.filter((acc) => acc.side === limitSide),
-          accounts.filter((acc) => acc.side === marketSide),
-          srcToken
-        );
-        console.log('  ✅ Cleanup complete');
-      } catch (cleanupError: any) {
-        console.log(`  ⚠️ Cleanup incomplete: ${cleanupError.message}`);
+      console.log(`\n  ❌ Strategy failed: ${shortError(e)}`);
+      if (group.opened) {
+        console.log('  🚨 Closing positions: leader LIMIT → follower MARKET...');
+        try {
+          // Та же схема, что и штатное закрытие: лидер — лимитки, вторая сторона — маркет
+          const biggest = [...accounts].sort((a, b) => (b.orderAmount ?? 0) - (a.orderAmount ?? 0))[0];
+          const limitSide = biggest?.side ?? 'long';
+          const marketSide = limitSide === 'long' ? 'short' : 'long';
+          await closeLeaderFollower(
+            accounts.filter((acc) => acc.side === limitSide),
+            accounts.filter((acc) => acc.side === marketSide),
+            srcToken
+          );
+          console.log('  ✅ Cleanup complete');
+        } catch (cleanupError: any) {
+          console.log(`  ⚠️ Cleanup incomplete: ${cleanupError.message}`);
+        }
+      } else {
+        // В этом цикле ничего не открывалось — старые позиции не трогаем
+        console.log('  ℹ️ Nothing opened this cycle — existing positions left untouched');
       }
 
       for (const acc of accounts) {
@@ -306,15 +337,12 @@ export class DeltaNeutralController {
   // ==================== ALLOCATION ====================
 
   /**
-   * Дельта-нейтральная аллокация: суммарный notional LONG == SHORT,
-   * эффективное плечо каждого кошелька ∈ [min, max].
-   *
-   * Решается напрямую за один проход (без перебора):
-   * 1. допустимый общий notional = пересечение возможностей сторон;
-   * 2. случайный total внутри пересечения;
-   * 3. распределение по кошелькам с точной суммой (distributeWithCaps).
+   * Дозагрузка до целевого плеча: стороны уже назначены (по открытым позициям
+   * в run()), здесь считается только ДОБОР: итог кошелька (старое + новое)
+   * ∈ [balance*min, balance*max], а стороны сводятся к одному итогу —
+   * дельта-нейтрально вместе со старыми позициями (planTopUp).
    */
-  private calculateAllocation(accounts: GroupAccount[], longCount: number, token: string): void {
+  private calculateAllocation(accounts: GroupAccount[], token: string): void {
     const levRange = LEVERAGE[token as keyof typeof LEVERAGE];
     if (!levRange) {
       throw new Error(`LEVERAGE для ${token} не задан — добавь ${token}: [мин, макс] в settings.ts`);
@@ -327,65 +355,56 @@ export class DeltaNeutralController {
       );
     }
 
-    // --- Стороны: меньшинство получает крупные кошельки (риск равномерный) ---
-    const shortCount = accounts.length - longCount;
-    const minorityIsLong = longCount <= shortCount;
-    const minorityCount = Math.min(longCount, shortCount);
-
-    const sorted = [...accounts].sort((a, b) => b.balance - a.balance);
-    sorted.forEach((acc, index) => {
-      const inMinority = index < minorityCount;
-      acc.side = inMinority === minorityIsLong ? 'long' : 'short';
-    });
-
     const longSide = accounts.filter((acc) => acc.side === 'long');
     const shortSide = accounts.filter((acc) => acc.side === 'short');
 
-    // --- Общий notional: пересечение возможностей двух сторон ---
-    const range = { min: minLev, max: maxLev };
-    const longBounds = sideNotionalBounds(longSide.map((acc) => acc.balance), range);
-    const shortBounds = sideNotionalBounds(shortSide.map((acc) => acc.balance), range);
-    const lo = Math.max(longBounds.min, shortBounds.min);
-    const hi = Math.min(longBounds.max, shortBounds.max);
-    if (lo > hi + 1e-9) {
+    const plan = planTopUp(
+      longSide.map((acc) => ({ balance: acc.balance, existing: acc.existingNotional })),
+      shortSide.map((acc) => ({ balance: acc.balance, existing: acc.existingNotional })),
+      { min: minLev, max: maxLev }
+    );
+    if (!plan) {
+      const existL = longSide.reduce((s, a) => s + a.existingNotional, 0);
+      const existS = shortSide.reduce((s, a) => s + a.existingNotional, 0);
       throw new Error(
-        `Группа не сводится в вилку при плече ${minLev}-${maxLev}x: ` +
-        `LONG тянет $${longBounds.min.toFixed(0)}-${longBounds.max.toFixed(0)}, ` +
-        `SHORT тянет $${shortBounds.min.toFixed(0)}-${shortBounds.max.toFixed(0)}. ` +
-        `Измени LEVERAGE или состав кошельков.`
+        `Группа не сводится в вилку при плече ${minLev}-${maxLev}x с учётом открытых позиций ` +
+        `(LONG $${existL.toFixed(0)}, SHORT $${existS.toFixed(0)}). ` +
+        `Измени LEVERAGE, состав кошельков или закрой позиции (режим 2).`
       );
     }
 
-    const total = lo + Math.random() * (hi - lo);
+    longSide.forEach((acc, index) => {
+      acc.orderAmount = plan.longs[index]!;
+      acc.leverage = Math.round(((acc.existingNotional + plan.longs[index]!) / acc.balance) * 10) / 10;
+    });
+    shortSide.forEach((acc, index) => {
+      acc.orderAmount = plan.shorts[index]!;
+      acc.leverage = Math.round(((acc.existingNotional + plan.shorts[index]!) / acc.balance) * 10) / 10;
+    });
 
-    // --- Распределение по кошелькам каждой стороны ---
-    for (const side of [longSide, shortSide]) {
-      const caps = side.map((acc) => ({
-        min: acc.balance * minLev,
-        max: acc.balance * maxLev,
-      }));
-      const notionals = distributeWithCaps(total, caps);
-      side.forEach((acc, index) => {
-        acc.orderAmount = notionals[index]!;
-        acc.leverage = Math.round((notionals[index]! / acc.balance) * 10) / 10;
-      });
-    }
-
-    const longTotal = longSide.reduce((s, a) => s + (a.orderAmount ?? 0), 0);
-    const shortTotal = shortSide.reduce((s, a) => s + (a.orderAmount ?? 0), 0);
+    const longAdd = longSide.reduce((s, a) => s + (a.orderAmount ?? 0), 0);
+    const shortAdd = shortSide.reduce((s, a) => s + (a.orderAmount ?? 0), 0);
+    const longFinal = longSide.reduce((s, a) => s + a.existingNotional + (a.orderAmount ?? 0), 0);
+    const shortFinal = shortSide.reduce((s, a) => s + a.existingNotional + (a.orderAmount ?? 0), 0);
     console.log(
-      `  📐 Allocation OK | LONG: $${longTotal.toFixed(2)} | SHORT: $${shortTotal.toFixed(2)} | ` +
-      `Δ: $${Math.abs(longTotal - shortTotal).toFixed(2)}`
+      `  📐 Allocation OK | add L: $${longAdd.toFixed(2)} | add S: $${shortAdd.toFixed(2)} | ` +
+      `final L: $${longFinal.toFixed(2)} | final S: $${shortFinal.toFixed(2)}`
     );
   }
 
   // ==================== LEADER-FOLLOWER ====================
 
   private async executeLeaderFollower(group: ActiveGroup, srcToken: string): Promise<void> {
-    const { accounts, groupConfig, id } = group;
-    const [longCount] = groupConfig;
+    const { accounts, id } = group;
 
-    // Determine leader side (biggest order = limit side)
+    // Дозагрузка не нужна: все кошельки уже в целевом плече — сразу в холд
+    const totalAdd = accounts.reduce((s, a) => s + (a.orderAmount ?? 0), 0);
+    if (totalAdd < 1) {
+      console.log('\n  ✅ Positions already at target leverage — skipping open, going to hold');
+      return;
+    }
+
+    // Determine leader side (biggest top-up = limit side)
     const biggest = [...accounts].sort((a, b) => (b.orderAmount ?? 0) - (a.orderAmount ?? 0))[0]!;
     const limitSide = biggest.side!;
     const marketSide = limitSide === 'long' ? 'short' : 'long';
@@ -397,9 +416,10 @@ export class DeltaNeutralController {
 
     // ========== OPEN ==========
     if (EXECUTION_MODE === 'all-market') {
+      group.opened = true;
       await this.openAllMarket(accounts, srcToken);
     } else {
-      await this.openLeaderFollower(srcToken, limitSide, marketSide, limitAccounts, marketAccounts);
+      await this.openLeaderFollower(group, srcToken, limitSide, marketSide, limitAccounts, marketAccounts);
     }
 
     // Step 6: Verify positions + log liquidation info
@@ -470,6 +490,13 @@ export class DeltaNeutralController {
           return;
         }
         await sleep(Math.min(5, Math.max(0.1, (holdUntil - Date.now()) / 1000)));
+      }
+      // stop()/halt вышли из цикла раньше дедлайна (Ctrl+C, Force Close) —
+      // позиции остаются открытыми, закрытие только через режим 2.
+      if (!this.isRunning || isTradingHalted()) {
+        console.log('  🛑 Hold interrupted by stop — positions left open');
+        this.isRunning = false;
+        return;
       }
       console.log('  ⏸️ Hold complete');
     } else {
@@ -567,39 +594,67 @@ export class DeltaNeutralController {
         });
         console.log(`  ✅ ${shortAddr(acc.address)} MARKET open filled`);
       } catch (e: any) {
-        console.log(`  ❌ MARKET open failed for ${shortAddr(acc.address)}: ${e.message}`);
+        console.log(`  ❌ MARKET open failed for ${shortAddr(acc.address)}: ${shortError(e)}`);
         await this.handleFailure(acc, e);
       }
     }));
   }
 
-  /** leader-follower: leader LIMIT (maker) → wait full fill → follower MARKET (taker, delta-matched). */
+  /** leader-follower: leader LIMIT (maker) → wait full fill → follower MARKET (taker, delta-matched).
+   * Филлы считаются по ДЕЛЬТЕ позиции относительно снимка до ордера:
+   * старые позиции не принимаются за филл и не участвуют в матчинге фолловера. */
   private async openLeaderFollower(
+    group: ActiveGroup,
     srcToken: string,
     limitSide: 'long' | 'short',
     marketSide: 'long' | 'short',
     limitAccounts: GroupAccount[],
     marketAccounts: GroupAccount[]
   ): Promise<void> {
-    // Leader places LIMIT orders (parallel)
-    console.log(`\n  📋 ${limitSide.toUpperCase()} placing LIMIT orders...`);
-    const pendingLeader = new Set(limitAccounts);
+    const midPrice = (await limitAccounts[0]!.service.getMarketSnapshot(srcToken)).midPrice;
+    const FILL_EPS = 0.001;
 
-    if (isTradingHalted()) throw new Error('Trading halted by Force Close');
-
-    await Promise.all(limitAccounts.map(async (acc) => {
+    interface LeaderTrack {
+      acc: GroupAccount;
+      preUnits: number;
+      targetUnits: number;
+      filledUnits: number;
+    }
+    const tracks: LeaderTrack[] = [];
+    for (const acc of limitAccounts) {
+      let preUnits = 0;
       try {
-        await acc.service.placePositionOrder({
-          instrument: srcToken,
-          executionSide: limitSide,
-          executionType: 'limit',
-          amountUsd: acc.orderAmount!,
-        });
-      } catch (e: any) {
-        console.log(`  ❌ LIMIT open failed for ${shortAddr(acc.address)}: ${e.message}`);
-        await this.handleFailure(acc, e);
+        preUnits = await acc.service.getPositionBaseUnits(srcToken);
+      } catch {
+        // позиция неизвестна — считаем с нуля, первый полл поправит
       }
-    }));
+      tracks.push({
+        acc,
+        preUnits,
+        targetUnits: (acc.orderAmount ?? 0) / midPrice,
+        filledUnits: 0,
+      });
+    }
+    const pendingLeader = new Set(tracks.filter((t) => t.targetUnits > 1e-9));
+
+    if (pendingLeader.size > 0) {
+      if (isTradingHalted()) throw new Error('Trading halted by Force Close');
+      console.log(`\n  📋 ${limitSide.toUpperCase()} placing LIMIT orders...`);
+      await Promise.all([...pendingLeader].map(async ({ acc }) => {
+        try {
+          await acc.service.placePositionOrder({
+            instrument: srcToken,
+            executionSide: limitSide,
+            executionType: 'limit',
+            amountUsd: acc.orderAmount!,
+          });
+        } catch (e: any) {
+          console.log(`  ❌ LIMIT open failed for ${shortAddr(acc.address)}: ${shortError(e)}`);
+          await this.handleFailure(acc, e);
+        }
+      }));
+      group.opened = true;
+    }
 
     // Retry loop for leader: poll fast up to REQUOTE_INTERVAL_SEC, then re-place.
     // Быстрый опрос = фолловер бьёт маркетом ближе к цене филла лидера.
@@ -614,19 +669,20 @@ export class DeltaNeutralController {
         if (isTradingHalted()) throw new Error('Trading halted by Force Close');
         await sleep(pollSec);
 
-        const results = await Promise.all([...pendingLeader].map(async (acc) => {
+        const results = await Promise.all([...pendingLeader].map(async (t) => {
           try {
-            const position = await acc.service.getPositionBaseUnits(srcToken);
-            return { acc, filled: position > 1e-10 };
+            const position = await t.acc.service.getPositionBaseUnits(srcToken);
+            return { t, delta: Math.max(0, position - t.preUnits) };
           } catch {
-            return { acc, filled: false };
+            return { t, delta: t.filledUnits };
           }
         }));
 
-        for (const { acc, filled } of results) {
-          if (filled) {
-            console.log(`  ✅ ${shortAddr(acc.address)} leader FILLED`);
-            pendingLeader.delete(acc);
+        for (const { t, delta } of results) {
+          t.filledUnits = delta;
+          if (delta >= t.targetUnits * (1 - FILL_EPS)) {
+            console.log(`  ✅ ${shortAddr(t.acc.address)} leader FILLED`);
+            pendingLeader.delete(t);
           }
         }
 
@@ -643,23 +699,21 @@ export class DeltaNeutralController {
       if (pendingLeader.size === 0) break;
 
       console.log(`  🔄 ${pendingLeader.size} leader limit(s) unfilled — re-placing...`);
-      await Promise.all([...pendingLeader].map(async (acc) => {
+      await Promise.all([...pendingLeader].map(async (t) => {
         try {
-          await acc.service.cancelAllOrders(srcToken);
+          await t.acc.service.cancelAllOrders(srcToken);
           // Достаём только недостающее: лидер мог заполниться частично
-          const snapshot = await acc.service.getMarketSnapshot(srcToken);
-          const filledUnits = await acc.service.getPositionBaseUnits(srcToken);
-          const remainingUnits = Math.max(0, (acc.orderAmount ?? 0) / snapshot.midPrice - filledUnits);
+          const remainingUnits = Math.max(0, t.targetUnits - t.filledUnits);
           if (remainingUnits <= 0) return;
-          await acc.service.placePositionOrder({
+          await t.acc.service.placePositionOrder({
             instrument: srcToken,
             executionSide: limitSide,
             executionType: 'limit',
-            amountUsd: acc.orderAmount!,
+            amountUsd: t.acc.orderAmount!,
             overrideBaseUnits: remainingUnits,
           });
         } catch (e: any) {
-          console.log(`  ⚠️ Leader re-place failed for ${shortAddr(acc.address)}: ${e.message}`);
+          console.log(`  ⚠️ Leader re-place failed for ${shortAddr(t.acc.address)}: ${shortError(e)}`);
         }
       }));
     }
@@ -671,53 +725,63 @@ export class DeltaNeutralController {
       try { await acc.service.cancelAllOrders(srcToken); } catch { /* ok */ }
     }));
 
-    // Read actual leader base units for exact delta matching
+    // Read actual leader DELTA for exact matching (старые позиции не в счёт)
     let totalLimitBaseUnits = 0;
-    for (const acc of limitAccounts) {
-      const units = await acc.service.getPositionBaseUnits(srcToken);
-      totalLimitBaseUnits += units;
-      console.log(`  📐 ${shortAddr(acc.address)} leader: ${parseFloat(units.toFixed(6))} ${srcToken}`);
+    for (const t of tracks) {
+      try {
+        const position = await t.acc.service.getPositionBaseUnits(srcToken);
+        t.filledUnits = Math.max(0, position - t.preUnits);
+      } catch {
+        // оставляем последнюю известную дельту
+      }
+      totalLimitBaseUnits += t.filledUnits;
+      console.log(`  📐 ${shortAddr(t.acc.address)} leader: ${parseFloat(t.filledUnits.toFixed(6))} ${srcToken}`);
     }
     console.log(`  📐 Total LEADER: ${parseFloat(totalLimitBaseUnits.toFixed(6))} ${srcToken}`);
 
-    // Distribute lots proportionally among followers
-    const totalFollowerWeight = marketAccounts.reduce((s, a) => s + (a.orderAmount ?? 1), 0);
-    const followerBaseUnits = marketAccounts.map((a) => {
-      const weight = (a.orderAmount ?? 1) / totalFollowerWeight;
-      return totalLimitBaseUnits * weight;
-    });
+    // Фолловеры с нулевой догрузкой не торгуют; остальные делят дельту пропорционально
+    const activeFollowers = marketAccounts.filter((a) => (a.orderAmount ?? 0) > 1e-9);
+    const totalFollowerWeight = activeFollowers.reduce((s, a) => s + (a.orderAmount ?? 0), 0);
+    const followerBaseUnits = new Map<GroupAccount, number>();
+    for (const a of activeFollowers) {
+      followerBaseUnits.set(a, totalLimitBaseUnits * ((a.orderAmount ?? 0) / totalFollowerWeight));
+    }
 
     // Follower places MARKET orders (parallel, exact lot matching).
     // Ошибка фолловера недопустима: группа осталась бы односторонней,
     // поэтому ретраим, а при полном провале откатываем ногу лидера.
-    await this.waitForBookRecovery(srcToken, marketSide, totalLimitBaseUnits, marketAccounts[0]!);
-
-    console.log(`\n  🚀 ${marketSide.toUpperCase()} placing MARKET orders (delta-matched)...`);
-    if (isTradingHalted()) throw new Error('Trading halted by Force Close');
-
     const failedFollowers: GroupAccount[] = [];
-    await Promise.all(marketAccounts.map(async (acc, i) => {
-      let lastError: any = null;
-      for (let attempt = 1; attempt <= 3; attempt++) {
-        try {
-          await acc.service.placePositionOrder({
-            instrument: srcToken,
-            executionSide: marketSide,
-            executionType: 'market',
-            amountUsd: acc.orderAmount!,
-            overrideBaseUnits: followerBaseUnits[i],
-          });
-          console.log(`  ✅ ${shortAddr(acc.address)} follower MARKET filled`);
-          return;
-        } catch (e: any) {
-          lastError = e;
-          console.log(`  ❌ MARKET order failed for ${shortAddr(acc.address)} (attempt ${attempt}/3): ${e.message}`);
-          if (attempt < 3) await sleep(1);
+    if (totalLimitBaseUnits > 1e-9 && activeFollowers.length > 0) {
+      await this.waitForBookRecovery(srcToken, marketSide, totalLimitBaseUnits, activeFollowers[0]!);
+
+      console.log(`\n  🚀 ${marketSide.toUpperCase()} placing MARKET orders (delta-matched)...`);
+      if (isTradingHalted()) throw new Error('Trading halted by Force Close');
+
+      await Promise.all(activeFollowers.map(async (acc) => {
+        let lastError: any = null;
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          try {
+            await acc.service.placePositionOrder({
+              instrument: srcToken,
+              executionSide: marketSide,
+              executionType: 'market',
+              amountUsd: acc.orderAmount!,
+              overrideBaseUnits: followerBaseUnits.get(acc)!,
+            });
+            console.log(`  ✅ ${shortAddr(acc.address)} follower MARKET filled`);
+            return;
+          } catch (e: any) {
+            lastError = e;
+            console.log(`  ❌ MARKET order failed for ${shortAddr(acc.address)} (attempt ${attempt}/3): ${shortError(e)}`);
+            if (attempt < 3) await sleep(1);
+          }
         }
-      }
-      failedFollowers.push(acc);
-      await this.handleFailure(acc, lastError);
-    }));
+        failedFollowers.push(acc);
+        await this.handleFailure(acc, lastError);
+      }));
+    } else {
+      console.log(`\n  ℹ️ ${marketSide.toUpperCase()} has nothing to match — skipping MARKET orders`);
+    }
 
     if (failedFollowers.length > 0) {
       throw new Error(

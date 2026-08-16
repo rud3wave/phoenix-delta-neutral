@@ -150,6 +150,16 @@ async function runDeltaNeutral(services: PhoenixService[]): Promise<void> {
     }
   }
 
+  // Stale orders from an interrupted run (killed close limits) must not
+  // interfere with the new cycle.
+  await Promise.all(services.flatMap((service) => TOKENS_TO_TRADE.map(async (symbol) => {
+    try {
+      await service.cancelAllOrders(symbol);
+    } catch (e: any) {
+      console.log(`  ⚠️ ${shortAddr(service.getAddress())} ${symbol} stale-order cleanup: ${e.message}`);
+    }
+  })));
+
   await sendTg(`BOT STARTED | ${services.length} wallet(s) | Delta-neutral mode`);
 
   // Run the controller loop

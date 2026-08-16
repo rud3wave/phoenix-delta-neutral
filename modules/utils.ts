@@ -77,6 +77,17 @@ export function shuffleArray<T>(arr: T[]): T[] {
   return result;
 }
 
+/**
+ * Компактная ошибка: одна строка без стектрейсов и полотен simulation-логов.
+ * Берёт первую строку «Program log:» — это ончейн-причина; иначе первую строку сообщения.
+ */
+export function shortError(e: unknown, max = 140): string {
+  const raw = String((e as { message?: unknown })?.message ?? e);
+  const programLog = raw.match(/Program log: (.+)/);
+  const line = (programLog ? programLog[1]! : raw.split('\n')[0]!).replace(/\s+/g, ' ').trim();
+  return line.length > max ? `${line.slice(0, max)}…` : line;
+}
+
 // ==================== ERROR CLASSIFICATION ====================
 
 const NETWORK_ERROR_CODES = [

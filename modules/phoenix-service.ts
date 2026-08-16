@@ -21,6 +21,7 @@ import { base58 } from '@scure/base';
 import {
   address,
   createSolanaRpc,
+  createSolanaRpcFromTransport,
   createTransactionMessage,
   setTransactionMessageFeePayer,
   appendTransactionMessageInstructions,
@@ -167,6 +168,22 @@ function createRpcFetch(proxyUrl?: string): typeof fetch {
     if (lastResponse) return lastResponse;
     throw lastError;
   }) as typeof fetch;
+}
+
+/** Kit-RPC поверх того же прокси-fetch, что и Connection: дефолтный транспорт
+ * ходит в публичный RPC напрямую без таймаута и может зависнуть навсегда. */
+function createProxiedKitRpc(endpoint: string, proxyUrl?: string): ReturnType<typeof createSolanaRpc> {
+  const rpcFetch = createRpcFetch(proxyUrl);
+  const transport = (async ({ payload }: { payload: unknown }) => {
+    const res = await rpcFetch(endpoint, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (res.status >= 400) throw new Error(`Solana RPC HTTP ${res.status}`);
+    return (await res.json()) as Record<string, unknown>;
+  }) as Parameters<typeof createSolanaRpcFromTransport>[0];
+  return createSolanaRpcFromTransport(transport) as unknown as ReturnType<typeof createSolanaRpc>;
 }
 
 // ==================== TYPES ====================
@@ -345,7 +362,7 @@ export class PhoenixService {
   private async activateReferralViaTx(): Promise<boolean> {
     const tag = this.walletAddress.slice(0, 6);
     const signer = await createKeyPairSignerFromBytes(this.wallet.secretKey);
-    const rpc = createSolanaRpc(this.connection.rpcEndpoint);
+    const rpc = createProxiedKitRpc(this.connection.rpcEndpoint, this.proxyUrl);
 
     const client = createPhoenixClient({
       apiUrl: PHOENIX_API_URL,

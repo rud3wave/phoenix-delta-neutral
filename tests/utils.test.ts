@@ -1,7 +1,28 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { formatTransactionLink, isMidStable } from '../modules/utils.js';
+import { formatTransactionLink, isMidStable, shortError } from '../modules/utils.js';
+
+test('shortError collapses simulation dumps to one Program log line', () => {
+  const dump = new Error(
+    'Simulation failed. \nMessage: Transaction simulation failed. \nLogs: \n[\n' +
+    '  "Program log: Failed to perform MatchingEngine::place_order",\n' +
+    '  "Program log: IOC order does not meet minimum requirements. Min base: 2465",\n' +
+    '  "Program EtrnLzgbS7nMMy5fbD42kXiUzGg8XQzJ972Xtk1cjWih invoke [2]",\n]'
+  );
+  const line = shortError(dump);
+  assert.ok(!line.includes('\n'));
+  assert.ok(line.startsWith('Failed to perform MatchingEngine::place_order'));
+  assert.ok(line.length <= 141);
+});
+
+test('shortError falls back to the first line and truncates', () => {
+  assert.equal(shortError(new Error('boom\nstack stack')), 'boom');
+  assert.equal(shortError('plain'), 'plain');
+  const long = shortError(new Error('x'.repeat(500)));
+  assert.equal(long.length, 141);
+  assert.ok(long.endsWith('…'));
+});
 
 test('transaction links hide raw signatures from plain logs', () => {
   assert.equal(formatTransactionLink('secret-signature', false), 'Transaction');

@@ -118,6 +118,9 @@ export function createKeypair(privateKey: string): Keypair {
 
 /** Encrypt a private key string using AES */
 export function encryptKey(plainKey: string): string {
+  if (!ENCRYPTION_PASSWORD) {
+    throw new Error('ENCRYPTION_PASSWORD пустой — задай пароль в global.js до первого запуска');
+  }
   return CryptoJS.AES.encrypt(plainKey, ENCRYPTION_PASSWORD).toString();
 }
 
@@ -161,10 +164,6 @@ export function readPrivateKeyEntries(): PrivateKeyEntry[] {
   }
   console.log(`📂 Loaded ${entries.length} private key(s) from privatekeys.txt`);
   return entries;
-}
-
-export function readPrivateKeys(): string[] {
-  return readPrivateKeyEntries().map((entry) => entry.privateKey);
 }
 
 /** Read proxies from input_data/proxies.txt */

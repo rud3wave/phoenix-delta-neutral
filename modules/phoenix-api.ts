@@ -181,10 +181,6 @@ export interface AuthTokenResponse {
   pop_key: string;
 }
 
-export interface RefreshTokenRequest {
-  refresh_token: string;
-}
-
 // --- EXCHANGE ---
 
 export interface OrderbookView {
@@ -317,53 +313,6 @@ export interface SolanaInstruction {
   programId: string;
 }
 
-export interface TpSlConfig {
-  numBaseLots?: number;
-  orderKind?: string;
-  quantity?: number;
-  stopLossExecutionPrice?: number;
-  stopLossTriggerPrice?: number;
-  takeProfitExecutionPrice?: number;
-  takeProfitTriggerPrice?: number;
-}
-
-export interface PlaceMarketOrderRequest {
-  authority: string;
-  symbol: string;
-  side: string;
-  quantity?: number;
-  numBaseLots?: number;
-  maxPriceInTicks?: number;
-  isReduceOnly?: boolean;
-  feePayer?: string;
-  pdaIndex?: number;
-  positionAuthority?: string;
-  skipTransferToParent?: boolean;
-  transferAmount?: number;
-  allowCrossAndIsolatedForAsset?: boolean;
-  tpSl?: TpSlConfig;
-}
-
-export interface PlaceLimitOrderRequest {
-  authority: string;
-  symbol: string;
-  side: string;
-  price?: number;
-  priceInTicks?: number;
-  quantity?: number;
-  numBaseLots?: number;
-  isPostOnly?: boolean;
-  isReduceOnly?: boolean;
-  slide?: boolean;
-  feePayer?: string;
-  pdaIndex?: number;
-  positionAuthority?: string;
-  skipTransferToParent?: boolean;
-  transferAmount?: number;
-  allowCrossAndIsolatedForAsset?: boolean;
-  tpSl?: TpSlConfig;
-}
-
 // --- REGISTER ---
 
 export interface BuildRegisterRequest {
@@ -400,18 +349,6 @@ export interface SendRegisterIxsResponse {
 
 // --- REFERRAL ---
 
-export interface ValidateInviteRequest {
-  code: string;
-  wallet_address: string;
-  transaction_signature?: string | null;
-}
-
-export interface ValidateInviteResponse {
-  success: boolean;
-  message: string;
-  whitelisted: boolean;
-}
-
 export interface ActivateReferralTxRequest {
   recent_blockhash: string;
   referral_code: string;
@@ -426,17 +363,6 @@ export interface ActivateReferralTxResponse {
   signature: string | null;
   status: 'activated' | 'submitted' | 'already_activated';
   trader_pda: string;
-}
-
-export interface ActivateReferralResponse {
-  success: boolean;
-  message: string;
-}
-
-export interface CheckWalletResponse {
-  whitelisted: boolean;
-  whitelisted_at?: string | null;
-  invite_code_used?: string | null;
 }
 
 // --- REWARDS / SPONSORSHIP ---
@@ -558,23 +484,11 @@ export class PhoenixApiClient {
     return this.extractBody<AuthTokenResponse>(res);
   }
 
-  public async refreshSession(req: RefreshTokenRequest): Promise<AuthTokenResponse> {
-    const res = await this.session.post(`${PHOENIX_API_URL}/v1/auth/refresh`, {
-      json: req,
-    });
-    return this.extractBody<AuthTokenResponse>(res);
-  }
-
   // ==================== EXCHANGE ====================
 
   public async getOrderbook(symbol: string): Promise<OrderbookView> {
     const res = await this.session.get(`${PHOENIX_API_URL}/v1/view/orderbook/${symbol}`);
     return this.extractBody<OrderbookView>(res);
-  }
-
-  public async getMarkets(): Promise<unknown[]> {
-    const res = await this.session.get(`${PHOENIX_API_URL}/v1/view/exchange/markets`);
-    return this.extractBody<unknown[]>(res);
   }
 
   // ==================== TRADER ====================
@@ -589,11 +503,6 @@ export class PhoenixApiClient {
       searchParams,
     });
     return this.extractBody<TraderStateResponse>(res);
-  }
-
-  public async getTraderCapabilities(): Promise<unknown> {
-    const res = await this.session.get(`${PHOENIX_API_URL}/v1/view/trader-capabilities`);
-    return this.extractBody<unknown>(res);
   }
 
   public async getTraderTradesHistory(
@@ -624,22 +533,6 @@ export class PhoenixApiClient {
     return this.extractBody<TraderFundingResponse>(res);
   }
 
-  // ==================== ORDERS ====================
-
-  public async buildMarketOrderInstructions(req: PlaceMarketOrderRequest): Promise<SolanaInstruction[]> {
-    const res = await this.session.post(`${PHOENIX_API_URL}/v1/ix/place-isolated-market-order`, {
-      json: req,
-    });
-    return this.extractBody<SolanaInstruction[]>(res);
-  }
-
-  public async buildLimitOrderInstructions(req: PlaceLimitOrderRequest): Promise<SolanaInstruction[]> {
-    const res = await this.session.post(`${PHOENIX_API_URL}/v1/ix/place-isolated-limit-order`, {
-      json: req,
-    });
-    return this.extractBody<SolanaInstruction[]>(res);
-  }
-
   // ==================== REGISTER ====================
 
   public async buildRegisterInstructions(req: BuildRegisterRequest): Promise<BuildRegisterResponse> {
@@ -657,31 +550,6 @@ export class PhoenixApiClient {
   }
 
   // ==================== REFERRAL ====================
-
-  public async validateInvite(req: ValidateInviteRequest): Promise<ValidateInviteResponse> {
-    const res = await this.session.post(`${PHOENIX_API_URL}/v1/invite/validate`, {
-      json: req,
-    });
-    return this.extractBody<ValidateInviteResponse>(res);
-  }
-
-  public async checkWallet(walletAddress: string): Promise<CheckWalletResponse> {
-    const res = await this.session.get(`${PHOENIX_API_URL}/v1/invite/check/${walletAddress}`);
-    return this.extractBody<CheckWalletResponse>(res);
-  }
-
-  public async activateReferral(req: {
-    code: string;
-    wallet_address: string;
-  }): Promise<ActivateReferralResponse> {
-    const res = await this.session.post(`${PHOENIX_API_URL}/v1/referral/activate`, {
-      json: {
-        ...req,
-        authority: req.wallet_address,
-      },
-    });
-    return this.extractBody<ActivateReferralResponse>(res);
-  }
 
   public async activateReferralTx(req: ActivateReferralTxRequest): Promise<ActivateReferralTxResponse> {
     const res = await this.session.post(`${PHOENIX_API_URL}/v1/referral/activate-tx`, {

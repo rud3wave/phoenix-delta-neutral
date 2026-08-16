@@ -48,16 +48,18 @@ import { formatTransactionLink, sleep } from './utils.js';
 import {
   PhoenixApiClient,
   type PendingEscrowRequest,
-  type SolanaInstruction,
   type TraderStateResponse,
 } from './phoenix-api.js';
-import { SLIPPAGE } from '../settings.js';
+import { SLIPPAGE, SOLANA_RPC_URLS } from '../settings.js';
 
 // ==================== CONFIG ====================
 
 const PHOENIX_API_URL = 'https://perp-api.phoenix.trade';
-const SOLANA_RPC = 'https://api.mainnet-beta.solana.com';
+const DEFAULT_SOLANA_RPC = 'https://api.mainnet-beta.solana.com';
 const REFERRAL_CODES = ['V9EZG25S', 'X95ET4N2', '23PUTC8U', 'PAKARXCD', 'GD77P82A'];
+
+// HTTP-статусы, при которых запрос повторяется на следующем RPC из списка
+const RPC_FAILOVER_STATUSES = new Set([429, 500, 502, 503, 504]);
 
 // On-chain authorities that fund referral / Flight Club rewards.
 // Referral program sender + CashDrop (Flight Club) sender — matches the
@@ -126,6 +128,42 @@ function createProxyFetch(proxyUrl?: string): typeof fetch {
   }) as typeof fetch;
 }
 
+/**
+ * Прокси + фолбэк по списку RPC из settings.SOLANA_RPC_URLS.
+ * JSON-RPC запрос не зависит от узла, поэтому при 429/5xx/сетевой ошибке
+ * тот же запрос просто уходит на следующий endpoint.
+ */
+function createRpcFetch(proxyUrl?: string): typeof fetch {
+  const baseFetch = createProxyFetch(proxyUrl);
+  const endpoints = SOLANA_RPC_URLS.length > 0 ? SOLANA_RPC_URLS : [DEFAULT_SOLANA_RPC];
+
+  return (async (url: string | URL | Request, init?: RequestInit) => {
+    const original = typeof url === 'string' ? url : url instanceof URL ? url.toString() : url.url;
+    let lastError: unknown = null;
+    let lastResponse: Response | null = null;
+
+    for (const endpoint of endpoints) {
+      const target = new URL(original);
+      const source = new URL(endpoint);
+      target.protocol = source.protocol;
+      target.host = source.host;
+
+      try {
+        const response = await baseFetch(target.toString(), init);
+        if (!RPC_FAILOVER_STATUSES.has(response.status)) return response;
+        console.log(`  ⚠️ RPC ${target.host}: HTTP ${response.status} → пробую следующий`);
+        lastResponse = response;
+      } catch (e) {
+        console.log(`  ⚠️ RPC ${target.host}: недоступен → пробую следующий`);
+        lastError = e;
+      }
+    }
+
+    if (lastResponse) return lastResponse;
+    throw lastError;
+  }) as typeof fetch;
+}
+
 // ==================== TYPES ====================
 
 export interface MarketSnapshot {
@@ -154,12 +192,9 @@ export interface PlacePositionOrderParams {
   executionSide: 'long' | 'short';
   executionType: 'market' | 'limit' | 'post-only';
   amountUsd: number;
-  leverage?: number;
   overrideBaseUnits?: number;
   reduceOnly?: boolean;
   maxSlippagePercent?: number;
-  takeProfitPricePercent?: number;
-  stopLossPricePercent?: number;
 }
 
 // ==================== SERVICE ====================
@@ -171,16 +206,15 @@ export class PhoenixService {
   private readonly walletAddress: string;
   private proxyUrl?: string;
   private baseLotsDecimalsCache: Record<string, number> = {};
-  private traderPda: string = '';
   private orderClient: ReturnType<typeof createPhoenixClient> | null = null;
 
   constructor(wallet: Keypair, proxyUrl?: string) {
     this.wallet = wallet;
     this.walletAddress = wallet.publicKey.toString();
     this.proxyUrl = proxyUrl;
-    this.connection = new Connection(SOLANA_RPC, {
+    this.connection = new Connection(SOLANA_RPC_URLS[0] ?? DEFAULT_SOLANA_RPC, {
       commitment: 'confirmed',
-      fetch: createProxyFetch(proxyUrl),
+      fetch: createRpcFetch(proxyUrl),
     });
     this.apiClient = new PhoenixApiClient({ proxyUrl });
   }
@@ -211,10 +245,6 @@ export class PhoenixService {
     return this.apiClient;
   }
 
-  public getTraderPda(): string {
-    return this.traderPda;
-  }
-
   public getProxyUrl(): string | undefined {
     return this.proxyUrl;
   }
@@ -230,9 +260,9 @@ export class PhoenixService {
     this.proxyUrl = newProxyUrl;
     this.orderClient?.dispose();
     this.orderClient = null;
-    this.connection = new Connection(SOLANA_RPC, {
+    this.connection = new Connection(SOLANA_RPC_URLS[0] ?? DEFAULT_SOLANA_RPC, {
       commitment: 'confirmed',
-      fetch: createProxyFetch(newProxyUrl),
+      fetch: createRpcFetch(newProxyUrl),
     });
     this.apiClient = new PhoenixApiClient({ proxyUrl: newProxyUrl });
     await this.loginHandler();
@@ -278,13 +308,11 @@ export class PhoenixService {
       const onChainState = state.snapshot?.capabilities?.state;
 
       if (onChainState === 'active') {
-        this.traderPda = state.authority;
         return;
       }
 
       if (onChainState) {
         // Registered but not fully active — finish referral onboarding via activate-tx
-        this.traderPda = state.authority;
         const activated = await this.activateReferralViaTx();
         if (!activated) {
           console.log(`  ⚠️ [${this.walletAddress.slice(0, 6)}] Registered but referral activation skipped`);
@@ -343,7 +371,6 @@ export class PhoenixService {
           });
 
           const response = await this.apiClient.activateReferralTx(built.request);
-          this.traderPda = response.trader_pda;
 
           if (response.status === 'already_activated') {
             return true;
@@ -385,8 +412,6 @@ export class PhoenixService {
       maxPositions: 128,
     });
 
-    this.traderPda = registerResponse.traderPda;
-
     if (!registerResponse.includeRegisterTrader || registerResponse.instructions.length === 0) {
       return;
     }
@@ -422,7 +447,6 @@ export class PhoenixService {
         traderSubaccountIndex: 0,
       });
 
-      this.traderPda = result.traderPda;
       console.log(`  ✅ [${tag}] Trader registered | ${formatTransactionLink(result.signature)}`);
       await this.waitUntilTraderActive(45_000);
     } catch (e: any) {
@@ -437,7 +461,6 @@ export class PhoenixService {
         const recheck = await this.apiClient.getTraderState(this.walletAddress);
         if (recheck.snapshot?.capabilities?.state) {
           console.log(`  ✅ [${tag}] Registration confirmed on-chain`);
-          this.traderPda = recheck.authority;
           return;
         }
       } catch {
@@ -454,7 +477,6 @@ export class PhoenixService {
         const state = await this.apiClient.getTraderState(this.walletAddress);
         const onChainState = state.snapshot?.capabilities?.state;
         if (onChainState) {
-          this.traderPda = state.authority;
           return;
         }
       } catch {
@@ -527,17 +549,6 @@ export class PhoenixService {
     return lots / Math.pow(10, decimals);
   }
 
-  // Read position size in base units (ETH, SOL, etc.)
-  public async getPositionBaseUnits(symbol: string): Promise<number> {
-    const state = await this.getPositions();
-    const position = this.findPosition(state, symbol);
-    if (!position) return 0;
-
-    await this.getBaseLotsDecimals(symbol);
-    const rawLots = Math.abs(Number(position.basePositionLots));
-    return this.lotsToBaseUnits(rawLots, symbol);
-  }
-
   public async getSignedPositionBaseUnits(symbol: string): Promise<number> {
     const state = await this.getPositions();
     const position = this.findPosition(state, symbol);
@@ -582,41 +593,6 @@ export class PhoenixService {
     }
 
     return out;
-  }
-
-  public async closeAllPositionsAndOrders(): Promise<void> {
-    const state = await this.apiClient.getTraderState(this.walletAddress);
-    const subaccounts = state.snapshot?.subaccounts ?? [];
-
-    for (const subaccount of subaccounts) {
-      const positions = subaccount.positions ?? [];
-
-      for (const position of positions) {
-        const baseLots = Number(position.basePositionLots);
-        if (baseLots === 0) continue;
-
-        // Close via SDK (cross-margin compatible)
-        const symbol = position.symbol;
-        await this.getBaseLotsDecimals(symbol);
-        const baseUnits = this.lotsToBaseUnits(Math.abs(baseLots), symbol);
-        const closeSide = baseLots > 0 ? 'short' : 'long'; // opposite side to close
-
-        console.log(`  🔄 Closing ${symbol} | ${closeSide.toUpperCase()} | ${baseUnits.toFixed(2)} ${symbol}`);
-
-        try {
-          await this.placePositionOrder({
-            instrument: symbol,
-            executionSide: closeSide as 'long' | 'short',
-            executionType: 'market',
-            amountUsd: 0,
-            overrideBaseUnits: baseUnits,
-          });
-          console.log(`  ✅ Position ${symbol} closed`);
-        } catch (e) {
-          console.log(`  ⚠️ Failed to close ${symbol}: ${e}`);
-        }
-      }
-    }
   }
 
   // ==================== CANCEL ORDERS ====================
@@ -699,33 +675,7 @@ export class PhoenixService {
     }
   }
 
-  // ==================== CLOSE BY LIMIT ====================
-
-  public async closePositionByLimit(symbol: string): Promise<void> {
-    const state = await this.getPositions();
-    const position = this.findPosition(state, symbol);
-
-    if (!position) {
-      console.log(`  ℹ️ No open position for ${symbol} to close`);
-      return;
-    }
-
-    // Close via SDK (cross-margin compatible)
-    await this.getBaseLotsDecimals(symbol);
-    const baseUnits = this.lotsToBaseUnits(Math.abs(Number(position.basePositionLots)), symbol);
-    const closeSide = Number(position.basePositionLots) > 0 ? 'short' : 'long';
-
-    console.log(`  📋 Closing ${symbol} via LIMIT | ${closeSide.toUpperCase()} | ${baseUnits.toFixed(2)} ${symbol}`);
-
-    await this.placePositionOrder({
-      instrument: symbol,
-      executionSide: closeSide as 'long' | 'short',
-      executionType: 'post-only',
-      amountUsd: 0,
-      overrideBaseUnits: baseUnits,
-      reduceOnly: true,
-    });
-  }
+  // ==================== CLOSE BY MARKET ====================
 
   public async closePositionByMarket(symbol: string): Promise<void> {
     const state = await this.getPositions();
@@ -1479,45 +1429,6 @@ export class PhoenixService {
     } finally {
       client.dispose();
     }
-  }
-
-  // ==================== TRANSACTION BUILDING ====================
-
-  public async buildSignAndSendTransaction(instructions: SolanaInstruction[]): Promise<string> {
-    const ixs = instructions.map((ix) => ({
-      programId: new PublicKey(ix.programId),
-      keys: ix.keys.map((key) => ({
-        pubkey: new PublicKey(key.pubkey),
-        isSigner: key.isSigner,
-        isWritable: key.isWritable,
-      })),
-      data: Buffer.from(ix.data),
-    }));
-
-    // Delay before sending
-    await sleep(2 + Math.random() * 1);
-
-    const { blockhash } = await this.connection.getLatestBlockhash('confirmed');
-
-    const messageV0 = new TransactionMessage({
-      payerKey: this.wallet.publicKey,
-      recentBlockhash: blockhash,
-      instructions: ixs,
-    }).compileToV0Message();
-
-    const transaction = new VersionedTransaction(messageV0);
-    transaction.sign([this.wallet]);
-
-    const rawTx = transaction.serialize();
-    const txHash = await this.connection.sendRawTransaction(rawTx, {
-      skipPreflight: false,
-      preflightCommitment: 'confirmed',
-      maxRetries: 5,
-    });
-
-    await this.waitForConfirmation(txHash);
-
-    return txHash;
   }
 
   // ==================== CONFIRMATION ====================

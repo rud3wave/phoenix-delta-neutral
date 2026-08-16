@@ -9,8 +9,8 @@
 
 import {
   GROUP_CONFIGS,
-  TOKEN_LEVERAGE,
-  POSITION_PERCENT,
+  LEVERAGE,
+  MIN_LIQ_DISTANCE_PERCENT,
   MAX_SPREAD,
   HOLD_MINUTES,
   TRADES_COUNT,
@@ -20,6 +20,7 @@ import {
   RETRY,
   EXECUTION_MODE,
 } from '../settings.js';
+import { distributeWithCaps, sideNotionalBounds } from './allocation.js';
 import { PhoenixService } from './phoenix-service.js';
 import { closeLeaderFollower } from './close-strategy.js';
 import { allocateTargets, executePaired } from './paired-execution.js';
@@ -180,10 +181,8 @@ export class DeltaNeutralController {
         const largerSideAccounts = shuffledRest.slice(0, largerSideCount);
         const remaining = shuffledRest.slice(largerSideCount);
 
-        // Randomly decide which side is LONG
-        const selected = Math.random() < 0.5
-          ? [...smallerSideAccounts, ...largerSideAccounts]
-          : [...largerSideAccounts, ...smallerSideAccounts];
+        // Порядок не важен: стороны назначает calculateAllocation по балансам
+        const selected = [...smallerSideAccounts, ...largerSideAccounts];
 
         // Refresh balances
         console.log('\n  🔄 Refreshing balances...');
@@ -303,155 +302,78 @@ export class DeltaNeutralController {
   // ==================== ALLOCATION ====================
 
   /**
-   * Distribute `total` into `n` parts where each part ∈ [min, max] and sum == total.
-   * Uses random constrained partitioning.
-   */
-  private distributeNotional(total: number, n: number, min: number, max: number): number[] | null {
-    if (n === 1) return total >= min && total <= max ? [total] : null;
-    if (total < n * min || total > n * max) return null;
-
-    const parts: number[] = new Array(n).fill(min);
-    let remaining = total - n * min;
-
-    for (let i = 0; i < n - 1 && remaining > 0; i++) {
-      const maxAdd = Math.min(max - min, remaining);
-      const add = Math.random() * maxAdd;
-      parts[i] += add;
-      remaining -= add;
-    }
-    parts[n - 1] += remaining;
-
-    // Fix floating-point drift
-    const drift = total - parts.reduce((s, p) => s + p, 0);
-    parts[n - 1] += drift;
-
-    return parts;
-  }
-
-  /**
-   * Try to compute a balanced allocation where LONG notional == SHORT notional exactly.
+   * Дельта-нейтральная аллокация: суммарный notional LONG == SHORT,
+   * эффективное плечо каждого кошелька ∈ [min, max].
    *
-   * Formula: notional = balance × (percent / 100) × leverage
-   * - percent from POSITION_PERCENT controls risk (liquidation distance)
-   * - leverage from TOKEN_LEVERAGE[token] controls position multiplier
-   */
-  private tryCalculateAllocation(accounts: GroupAccount[], longCount: number, token: string): boolean {
-    const levRange = TOKEN_LEVERAGE[token as keyof typeof TOKEN_LEVERAGE] ?? TOKEN_LEVERAGE.ETH;
-    const [minLev, maxLev] = levRange;
-    const [minPct, maxPct] = POSITION_PERCENT;
-
-    const sorted = [...accounts].sort((a, b) => b.balance - a.balance);
-
-    const longIsSource = longCount <= accounts.length - longCount;
-    const sourceCount = longIsSource ? longCount : accounts.length - longCount;
-    const targetCount = accounts.length - sourceCount;
-
-    const sourceAccounts = sorted.slice(0, sourceCount);
-    const targetAccounts = sorted.slice(sourceCount);
-
-    // --- Source side: notional = balance × (percent/100) × leverage ---
-    const sourceData: { account: GroupAccount; leverage: number; notional: number }[] = [];
-    let targetNotional = 0;
-
-    for (const acc of sourceAccounts) {
-      const leverage = getRandomNumber(levRange);
-      const pct = getRandomNumber(POSITION_PERCENT);
-      const notional = acc.balance * (pct / 100) * leverage;
-      if (notional <= 0) return false;
-      sourceData.push({ account: acc, leverage, notional });
-      targetNotional += notional;
-    }
-
-    // --- Target side: derived to match ---
-    const targetCaps = targetAccounts.map((acc) => ({
-      account: acc,
-      minCap: acc.balance * (minPct / 100) * minLev,
-      maxCap: acc.balance * (maxPct / 100) * maxLev,
-    }));
-
-    const totalMinCap = targetCaps.reduce((s, c) => s + c.minCap, 0);
-    const totalMaxCap = targetCaps.reduce((s, c) => s + c.maxCap, 0);
-    if (targetNotional < totalMinCap || targetNotional > totalMaxCap) return false;
-
-    const rawWeights = targetCaps.map((c) => c.maxCap);
-    const totalWeight = rawWeights.reduce((s, w) => s + w, 0);
-
-    let parts: number[] | null = this.distributeNotional(
-      targetNotional, targetCount,
-      Math.max(...targetCaps.map((c) => c.minCap)),
-      Math.min(...targetCaps.map((c) => c.maxCap))
-    );
-
-    if (!parts) {
-      parts = [];
-      let allocated = 0;
-      for (let i = 0; i < targetCount - 1; i++) {
-        const proportional = (rawWeights[i] / totalWeight) * targetNotional;
-        const clamped = Math.max(targetCaps[i]!.minCap, Math.min(targetCaps[i]!.maxCap, proportional));
-        parts.push(clamped);
-        allocated += clamped;
-      }
-      const last = targetNotional - allocated;
-      if (last < targetCaps[targetCount - 1]!.minCap || last > targetCaps[targetCount - 1]!.maxCap) return false;
-      parts.push(last);
-    }
-
-    // Derive leverage for each target wallet
-    const targetData: { account: GroupAccount; leverage: number; notional: number }[] = [];
-
-    for (let i = 0; i < targetCount; i++) {
-      const acc = targetAccounts[i]!;
-      const part = parts[i]!;
-
-      let pctLow = (part / (acc.balance * maxLev)) * 100;
-      let pctHigh = (part / (acc.balance * minLev)) * 100;
-      pctLow = Math.max(pctLow, minPct);
-      pctHigh = Math.min(pctHigh, maxPct);
-      if (pctLow > pctHigh || pctLow <= 0) return false;
-
-      const pct = pctLow + Math.random() * (pctHigh - pctLow);
-      const leverage = part / (acc.balance * (pct / 100));
-      const roundedLev = Math.round(leverage * 10) / 10;
-      if (roundedLev < minLev || roundedLev > maxLev) return false;
-
-      targetData.push({ account: acc, leverage: roundedLev, notional: part });
-    }
-
-    // --- Liquidation safety (hardcoded 10% min distance) ---
-    const MIN_LIQ_DISTANCE = 10;
-    for (const d of [...sourceData, ...targetData]) {
-      const effectiveLev = d.notional / d.account.balance;
-      if ((1 / effectiveLev) * 100 < MIN_LIQ_DISTANCE) return false;
-    }
-
-    // --- Assign ---
-    for (const d of sourceData) {
-      d.account.side = longIsSource ? 'long' : 'short';
-      d.account.orderAmount = d.notional;
-      d.account.leverage = d.leverage;
-    }
-    for (const d of targetData) {
-      d.account.side = longIsSource ? 'short' : 'long';
-      d.account.orderAmount = d.notional;
-      d.account.leverage = d.leverage;
-    }
-
-    return true;
-  }
-
-  /**
-   * Public allocation entry point — retries up to 1000 times.
+   * Решается напрямую за один проход (без перебора):
+   * 1. допустимый общий notional = пересечение возможностей сторон;
+   * 2. случайный total внутри пересечения;
+   * 3. распределение по кошелькам с точной суммой (distributeWithCaps).
    */
   private calculateAllocation(accounts: GroupAccount[], longCount: number, token: string): void {
-    for (let attempt = 0; attempt < 1000; attempt++) {
-      if (this.tryCalculateAllocation(accounts, longCount, token)) {
-        const longTotal = accounts.filter((a) => a.side === 'long').reduce((s, a) => s + (a.orderAmount ?? 0), 0);
-        const shortTotal = accounts.filter((a) => a.side === 'short').reduce((s, a) => s + (a.orderAmount ?? 0), 0);
-        console.log(`  📐 Allocation OK (attempt ${attempt + 1}) | LONG: $${longTotal.toFixed(2)} | SHORT: $${shortTotal.toFixed(2)} | Δ: $${Math.abs(longTotal - shortTotal).toFixed(2)}`);
-        return;
-      }
+    const levRange = LEVERAGE[token as keyof typeof LEVERAGE];
+    if (!levRange) {
+      throw new Error(`LEVERAGE для ${token} не задан — добавь ${token}: [мин, макс] в settings.ts`);
     }
-    throw new Error('Failed to calculate delta-neutral allocation after 1000 attempts');
+    const minLev = levRange[0];
+    const maxLev = Math.min(levRange[1], 100 / MIN_LIQ_DISTANCE_PERCENT);
+    if (maxLev < minLev) {
+      throw new Error(
+        `${token}: плечо от ${minLev}x недостижимо при MIN_LIQ_DISTANCE_PERCENT=` +
+        `${MIN_LIQ_DISTANCE_PERCENT} (потолок ${maxLev.toFixed(1)}x)`
+      );
+    }
+
+    // --- Стороны: меньшинство получает крупные кошельки (риск равномерный) ---
+    const shortCount = accounts.length - longCount;
+    const minorityIsLong = longCount <= shortCount;
+    const minorityCount = Math.min(longCount, shortCount);
+
+    const sorted = [...accounts].sort((a, b) => b.balance - a.balance);
+    sorted.forEach((acc, index) => {
+      const inMinority = index < minorityCount;
+      acc.side = inMinority === minorityIsLong ? 'long' : 'short';
+    });
+
+    const longSide = accounts.filter((acc) => acc.side === 'long');
+    const shortSide = accounts.filter((acc) => acc.side === 'short');
+
+    // --- Общий notional: пересечение возможностей двух сторон ---
+    const range = { min: minLev, max: maxLev };
+    const longBounds = sideNotionalBounds(longSide.map((acc) => acc.balance), range);
+    const shortBounds = sideNotionalBounds(shortSide.map((acc) => acc.balance), range);
+    const lo = Math.max(longBounds.min, shortBounds.min);
+    const hi = Math.min(longBounds.max, shortBounds.max);
+    if (lo > hi + 1e-9) {
+      throw new Error(
+        `Группа не сводится в вилку при плече ${minLev}-${maxLev}x: ` +
+        `LONG тянет $${longBounds.min.toFixed(0)}-${longBounds.max.toFixed(0)}, ` +
+        `SHORT тянет $${shortBounds.min.toFixed(0)}-${shortBounds.max.toFixed(0)}. ` +
+        `Измени LEVERAGE, MIN_LIQ_DISTANCE_PERCENT или состав кошельков.`
+      );
+    }
+
+    const total = lo + Math.random() * (hi - lo);
+
+    // --- Распределение по кошелькам каждой стороны ---
+    for (const side of [longSide, shortSide]) {
+      const caps = side.map((acc) => ({
+        min: acc.balance * minLev,
+        max: acc.balance * maxLev,
+      }));
+      const notionals = distributeWithCaps(total, caps);
+      side.forEach((acc, index) => {
+        acc.orderAmount = notionals[index]!;
+        acc.leverage = Math.round((notionals[index]! / acc.balance) * 10) / 10;
+      });
+    }
+
+    const longTotal = longSide.reduce((s, a) => s + (a.orderAmount ?? 0), 0);
+    const shortTotal = shortSide.reduce((s, a) => s + (a.orderAmount ?? 0), 0);
+    console.log(
+      `  📐 Allocation OK | LONG: $${longTotal.toFixed(2)} | SHORT: $${shortTotal.toFixed(2)} | ` +
+      `Δ: $${Math.abs(longTotal - shortTotal).toFixed(2)}`
+    );
   }
 
   // ==================== LEADER-FOLLOWER ====================
@@ -632,7 +554,6 @@ export class DeltaNeutralController {
           executionSide: acc.side!,
           executionType: 'market',
           amountUsd: acc.orderAmount!,
-          leverage: acc.leverage,
         });
         console.log(`  ✅ ${shortAddr(acc.address)} MARKET open filled`);
       } catch (e: any) {

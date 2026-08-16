@@ -44,13 +44,18 @@ import {
 import nacl from 'tweetnacl';
 import { gotScraping } from 'got-scraping';
 
-import { formatTransactionLink, sleep } from './utils.js';
+import { formatTransactionLink, isMidStable, sleep } from './utils.js';
 import {
   PhoenixApiClient,
   type PendingEscrowRequest,
   type TraderStateResponse,
 } from './phoenix-api.js';
-import { SLIPPAGE, SOLANA_RPC_URLS } from '../settings.js';
+import {
+  SLIPPAGE,
+  SOLANA_RPC_URLS,
+  MAX_MID_DRIFT_PERCENT,
+  MID_STABILITY_WINDOW_SEC,
+} from '../settings.js';
 
 // ==================== CONFIG ====================
 
@@ -761,31 +766,49 @@ export class PhoenixService {
     timeoutSeconds: number
   ): Promise<{ midPrice: number; spreadPercent: number }> {
     const startTime = Date.now();
+    const windowMs = MID_STABILITY_WINDOW_SEC * 1000;
+    const mids: Array<{ t: number; mid: number }> = [];
+    let lastLogAt = 0;
 
     while (true) {
       const snapshot = await this.getMarketSnapshot(symbol);
+      const now = Date.now();
 
-      if (snapshot.spreadPercent <= maxSpreadPercent) {
+      mids.push({ t: now, mid: snapshot.midPrice });
+      while (mids.length > 1 && now - mids[0]!.t > windowMs) mids.shift();
+
+      const spreadOk = snapshot.spreadPercent <= maxSpreadPercent;
+      const stableOk = isMidStable(mids, now, windowMs, MAX_MID_DRIFT_PERCENT);
+
+      if (spreadOk && stableOk) {
+        const drift = mids.length > 1
+          ? (Math.abs(snapshot.midPrice - mids[0]!.mid) / mids[0]!.mid) * 100
+          : 0;
         console.log(
           `  📊 Spread OK: ${snapshot.spreadPercent.toFixed(2)}% <= ` +
-          `${maxSpreadPercent.toFixed(2)}% | mid: ${snapshot.midPrice.toFixed(2)}`
+          `${maxSpreadPercent.toFixed(2)}% | drift ${drift.toFixed(3)}% | ` +
+          `mid: ${snapshot.midPrice.toFixed(2)}`
         );
         return { midPrice: snapshot.midPrice, spreadPercent: snapshot.spreadPercent };
       }
 
-      if (Date.now() - startTime > timeoutSeconds * 1000) {
+      if (now - startTime > timeoutSeconds * 1000) {
         throw new Error(
-          `Spread timeout: ${snapshot.spreadPercent.toFixed(2)}% > ` +
-          `${maxSpreadPercent.toFixed(2)}% for ${timeoutSeconds}s`
+          `Entry timeout: spread ${snapshot.spreadPercent.toFixed(2)}% / ` +
+          `mid drift limit ${MAX_MID_DRIFT_PERCENT.toFixed(2)}% not met for ${timeoutSeconds}s`
         );
       }
 
-      console.log(
-        `  ⏳ Waiting for spread: ${snapshot.spreadPercent.toFixed(2)}% > ` +
-        `${maxSpreadPercent.toFixed(2)}%...`
-      );
+      // Логируем не чаще раза в pollingSeconds, чтобы не спамить на 1с-каденсе
+      if (now - lastLogAt >= pollingSeconds * 1000) {
+        lastLogAt = now;
+        const reason = !spreadOk
+          ? `spread ${snapshot.spreadPercent.toFixed(2)}% > ${maxSpreadPercent.toFixed(2)}%`
+          : `mid moving > ${MAX_MID_DRIFT_PERCENT.toFixed(2)}% per ${MID_STABILITY_WINDOW_SEC}s`;
+        console.log(`  ⏳ Waiting for entry: ${reason}...`);
+      }
 
-      await sleep(pollingSeconds);
+      await sleep(1);
     }
   }
 

@@ -20,6 +20,7 @@ import {
   TOKENS_TO_TRADE,
   RETRY,
   EXECUTION_MODE,
+  FILL_POLL_INTERVAL_MS,
 } from '../settings.js';
 import { distributeWithCaps, sideNotionalBounds } from './allocation.js';
 import { PhoenixService } from './phoenix-service.js';
@@ -582,14 +583,17 @@ export class DeltaNeutralController {
       }
     }));
 
-    // Retry loop for leader: poll every 1s up to 2min, then re-place unfilled
-    console.log(`  ⏳ Waiting for leader fills (checking every 1s, up to 2min)...`);
+    // Retry loop for leader: poll fast up to 2min, then re-place unfilled.
+    // Быстрый опрос = фолловер бьёт маркетом ближе к цене филла лидера.
+    const pollSec = FILL_POLL_INTERVAL_MS / 1000;
+    const pollsPerRound = Math.max(1, Math.round(120 / pollSec));
+    console.log(`  ⏳ Waiting for leader fills (checking every ${FILL_POLL_INTERVAL_MS}ms, up to 2min)...`);
     while (pendingLeader.size > 0) {
       let stillWaiting: GroupAccount[] = [];
 
-      for (let i = 0; i < 120 && pendingLeader.size > 0; i++) {
+      for (let i = 0; i < pollsPerRound && pendingLeader.size > 0; i++) {
         if (isTradingHalted()) throw new Error('Trading halted by Force Close');
-        await sleep(1);
+        await sleep(pollSec);
 
         stillWaiting = [];
         for (const acc of pendingLeader) {

@@ -27,6 +27,28 @@ export function isRangeEmpty(range: readonly number[]): boolean {
   return range[0] === 0 && range[1] === 0;
 }
 
+/**
+ * Рынок «спокоен», если за окно наблюдения mid не ушёл дальше maxDriftPercent.
+ * Образцов должно быть ≥2 и они должны покрывать почти всё окно
+ * (допуск 1.5с на редкие задержки API).
+ */
+export function isMidStable(
+  samples: Array<{ t: number; mid: number }>,
+  now: number,
+  windowMs: number,
+  maxDriftPercent: number
+): boolean {
+  if (samples.length < 2) return false;
+
+  const oldest = samples[0]!;
+  const newest = samples[samples.length - 1]!;
+  if (oldest.mid <= 0 || newest.mid <= 0) return false;
+  if (now - oldest.t < windowMs - 1500) return false;
+
+  const driftPercent = (Math.abs(newest.mid - oldest.mid) / oldest.mid) * 100;
+  return driftPercent <= maxDriftPercent;
+}
+
 /** Escape special characters for Telegram MarkdownV2 */
 export function escapeMarkdownV2(text: string): string {
   return text?.replace(/([_*[\]()~`>#+=|{}.!\\|-])/g, '\\$1') || '';

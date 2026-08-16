@@ -8,7 +8,12 @@
 // maker-close and falls back to MARKET after MAKER_CLOSE_TIMEOUT_SEC.
 // ============================================================
 
-import { EXECUTION_MODE, FILL_POLL_INTERVAL_MS, MAKER_CLOSE_TIMEOUT_SEC } from '../settings.js';
+import {
+  EXECUTION_MODE,
+  FILL_POLL_INTERVAL_MS,
+  MAKER_CLOSE_TIMEOUT_SEC,
+  REQUOTE_INTERVAL_SEC,
+} from '../settings.js';
 import { PhoenixService } from './phoenix-service.js';
 import { sleep, shortAddr } from './utils.js';
 
@@ -39,7 +44,7 @@ async function waitUntilClosed(
 ): Promise<CloseAccount[]> {
   const pollSec = FILL_POLL_INTERVAL_MS / 1000;
   const roundStart = Date.now();
-  const roundDeadline = roundStart + 120_000;
+  const roundDeadline = roundStart + REQUOTE_INTERVAL_SEC * 1000;
   let lastLogAt = 0;
   let stillOpen: CloseAccount[] = [];
 
@@ -166,7 +171,7 @@ export async function closeLeaderFollower(
 
   while (pendingClose.size > 0) {
     closeRetryCount++;
-    console.log(`\n  ⏳ Polling leader close fills every ${FILL_POLL_INTERVAL_MS}ms, up to 2min (attempt ${closeRetryCount})...`);
+    console.log(`\n  ⏳ Polling leader close fills every ${FILL_POLL_INTERVAL_MS}ms, up to ${REQUOTE_INTERVAL_SEC}s (attempt ${closeRetryCount})...`);
 
     await waitUntilClosed(pendingClose, symbol, (acc) => {
       console.log(`  ✅ ${shortAddr(acc.service.getAddress())} leader closed via LIMIT (maker)`);

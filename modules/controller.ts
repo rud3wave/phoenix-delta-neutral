@@ -20,6 +20,7 @@ import {
   RETRY,
   EXECUTION_MODE,
   FILL_POLL_INTERVAL_MS,
+  REQUOTE_INTERVAL_SEC,
 } from '../settings.js';
 import { distributeWithCaps, sideNotionalBounds } from './allocation.js';
 import { PhoenixService } from './phoenix-service.js';
@@ -581,13 +582,13 @@ export class DeltaNeutralController {
       }
     }));
 
-    // Retry loop for leader: poll fast up to 2min, then re-place unfilled.
+    // Retry loop for leader: poll fast up to REQUOTE_INTERVAL_SEC, then re-place.
     // Быстрый опрос = фолловер бьёт маркетом ближе к цене филла лидера.
     const pollSec = FILL_POLL_INTERVAL_MS / 1000;
-    console.log(`  ⏳ Waiting for leader fills (checking every ${FILL_POLL_INTERVAL_MS}ms, up to 2min)...`);
+    console.log(`  ⏳ Waiting for leader fills (checking every ${FILL_POLL_INTERVAL_MS}ms, up to ${REQUOTE_INTERVAL_SEC}s)...`);
     while (pendingLeader.size > 0) {
       const roundStart = Date.now();
-      const roundDeadline = roundStart + 120_000;
+      const roundDeadline = roundStart + REQUOTE_INTERVAL_SEC * 1000;
       let lastLogAt = 0;
 
       while (pendingLeader.size > 0 && Date.now() < roundDeadline) {

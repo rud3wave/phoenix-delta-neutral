@@ -1,9 +1,10 @@
 // ============================================================
 //  CONTROLLER — Delta-neutral strategy execution
 // ============================================================
-// Leader-follower: limit side opens first → wait for fill →
-// cancel unfilled → market side matches exact lots.
-// Smart close: majority LIMIT (maker), minority MARKET (taker).
+// Leader-follower: leader side places LIMIT (maker) → poll fills
+// every 1s (re-place after 2min) → follower side hits MARKET (taker)
+// with the exact leader lots.
+// Close: leader LIMIT (maker) → follower MARKET (taker).
 // Two TG messages: #1 after open, #2 after close with PnL.
 // ============================================================
 
@@ -23,8 +24,6 @@ import {
 import { distributeWithCaps, sideNotionalBounds } from './allocation.js';
 import { PhoenixService } from './phoenix-service.js';
 import { closeLeaderFollower } from './close-strategy.js';
-import { allocateTargets, executePaired } from './paired-execution.js';
-import { collectCycleReport, formatCycleMetrics } from './execution-report.js';
 import { isTradingHalted } from './runtime-control.js';
 import { sendTg } from './telegram.js';
 import {
@@ -270,8 +269,7 @@ export class DeltaNeutralController {
       console.log(`  📊 ${srcToken} | LONG(${longAccounts.length}): $${longTotal.toFixed(2)} | SHORT(${shortAccounts.length}): $${shortTotal.toFixed(2)} | Mid: $${midPrice.toFixed(2)}`);
 
       // Step 3: Leader-follower execution
-      const cycleStartTimeMs = Date.now() - 1000;
-      await this.executeLeaderFollower(group, srcToken, cycleStartTimeMs);
+      await this.executeLeaderFollower(group, srcToken);
 
       // Step 4: Mark trades completed
       for (const acc of accounts) {
@@ -281,17 +279,56 @@ export class DeltaNeutralController {
       console.log(`\n  ✅ Group ${group.id} cycle completed`);
     } catch (e: any) {
       console.log(`\n  ❌ Strategy failed: ${e.message}`);
-      console.log('  Attempting strict leader/follower cleanup...');
-      try {
-        await closeLeaderFollower(
-          accounts.filter((acc) => acc.side === 'long'),
-          accounts.filter((acc) => acc.side === 'short'),
-          srcToken
-        );
-        console.log('  ✅ Strict cleanup complete');
-      } catch (cleanupError: any) {
-        console.log(`  ❌ Strict cleanup incomplete: ${cleanupError.message}`);
+      console.log('  🚨 Emergency cleanup via LIMIT (maker)...');
+
+      // Close all via limit with retry loop (same as normal close)
+      const pendingCleanup = new Set(accounts);
+
+      // Initial limit placement
+      await Promise.all(accounts.map(async (acc) => {
+        try {
+          await acc.service.closePositionByLimit(srcToken);
+        } catch {
+          // best effort
+        }
+      }));
+
+      // Retry until all closed: poll every 1s up to 2min, then re-place unfilled
+      while (pendingCleanup.size > 0) {
+        let stillOpen: GroupAccount[] = [];
+
+        for (let i = 0; i < 120 && pendingCleanup.size > 0; i++) {
+          await sleep(1);
+
+          stillOpen = [];
+          for (const acc of pendingCleanup) {
+            try {
+              const position = await acc.service.getPositionBaseUnits(srcToken);
+              if (position > 1e-10) stillOpen.push(acc);
+            } catch {
+              stillOpen.push(acc);
+            }
+          }
+
+          for (const acc of pendingCleanup) {
+            if (!stillOpen.includes(acc)) pendingCleanup.delete(acc);
+          }
+        }
+
+        if (pendingCleanup.size === 0) break;
+
+        // Re-place unfilled
+        await Promise.all(stillOpen.map(async (acc) => {
+          try {
+            await acc.service.cancelAllOrders(srcToken);
+            await acc.service.closePositionByLimit(srcToken);
+          } catch {
+            // best effort
+          }
+        }));
       }
+
+      console.log('  ✅ Emergency cleanup complete (maker)');
 
       for (const acc of accounts) {
         await this.handleFailure(acc, e);
@@ -378,11 +415,7 @@ export class DeltaNeutralController {
 
   // ==================== LEADER-FOLLOWER ====================
 
-  private async executeLeaderFollower(
-    group: ActiveGroup,
-    srcToken: string,
-    cycleStartTimeMs: number
-  ): Promise<void> {
+  private async executeLeaderFollower(group: ActiveGroup, srcToken: string): Promise<void> {
     const { accounts, groupConfig, id } = group;
     const [longCount] = groupConfig;
 
@@ -428,7 +461,7 @@ export class DeltaNeutralController {
 
       try {
         const snap = await accounts[0]!.service.getMarketSnapshot(srcToken);
-        lines.push(`📊 ${srcToken} | Spread: ${snap.spreadPercent.toFixed(2)}% | Mid: $${snap.midPrice.toFixed(2)}`);
+        lines.push(`📊 ${srcToken} | Spread: ${snap.spreadPercent.toFixed(4)}% | Mid: $${snap.midPrice.toFixed(2)}`);
       } catch {
         lines.push(srcToken);
       }
@@ -477,7 +510,11 @@ export class DeltaNeutralController {
       console.log('\n  ⏸️ Holding indefinitely — close manually via mode 2');
       // Wait until stopped
       while (this.isRunning) {
-        await sleep(60);
+        if (isTradingHalted()) {
+          this.isRunning = false;
+          return;
+        }
+        await sleep(5);
       }
       return;
     }
@@ -491,34 +528,24 @@ export class DeltaNeutralController {
       lines.push(`📂 POSITIONS CLOSED | Group ${id}`);
       lines.push('');
 
-      const report = await collectCycleReport(
-        accounts.map((acc) => acc.service),
-        srcToken,
-        cycleStartTimeMs
-      ).catch((error: any) => {
-        console.log(`  ⚠️ Full-cycle report unavailable: ${error.message}`);
-        return null;
-      });
-      let fallbackPnl = 0;
-      let fallbackVolume = 0;
+      let totalPnl = 0;
+      let totalVolume = 0;
 
       for (const acc of accounts) {
         try {
           const bal = await acc.service.getUsdcBalance();
           acc.balanceAfter = bal;
-          const walletMetrics = report?.byWallet.get(shortAddr(acc.address));
-          const pnl = walletMetrics?.netPnl ?? (bal - acc.balanceBefore);
-          const volume = walletMetrics?.actualVolume ?? (acc.orderAmount ?? 0) * 2;
-          fallbackPnl += pnl;
-          fallbackVolume += volume;
+          const pnl = bal - acc.balanceBefore;
+          totalPnl += pnl;
+          totalVolume += acc.orderAmount ?? 0;
 
           const emoji = acc.side === 'long' ? '🟢' : '🔴';
           const side = acc.side === 'long' ? 'LONG' : 'SHORT';
           const pnlSign = pnl >= 0 ? '+' : '';
           const pnlEmoji = pnl >= 0 ? '📈' : '📉';
           lines.push(
-            `${emoji} ${side} ${shortAddr(acc.address)} | ${pnlEmoji} PnL: ${pnlSign}${pnl.toFixed(2)}$ | ` +
-            `Bal: $${bal.toFixed(2)} | Cycle vol: $${volume.toFixed(2)}`
+            `${emoji} ${side} ${shortAddr(acc.address)} | ${pnlEmoji} PnL: ${pnlSign}${pnl.toFixed(4)}$ | ` +
+            `Bal: $${bal.toFixed(2)} | Vol: $${(acc.orderAmount ?? 0).toFixed(2)}`
           );
         } catch {
           const emoji = acc.side === 'long' ? '🟢' : '🔴';
@@ -526,15 +553,14 @@ export class DeltaNeutralController {
         }
       }
 
+      const costPer100k = totalVolume > 0 ? (-totalPnl / totalVolume) * 100000 : 0;
+      const pnlSign = totalPnl >= 0 ? '+' : '';
+      const totalEmoji = totalPnl >= 0 ? '📈' : '📉';
+
       lines.push('');
-      if (report) {
-        lines.push(...formatCycleMetrics(report.metrics));
-      } else {
-        const costPer100k = fallbackVolume > 0 ? (-fallbackPnl / fallbackVolume) * 100_000 : 0;
-        lines.push(`📊 Full-cycle balance PnL: ${fallbackPnl >= 0 ? '+' : ''}${fallbackPnl.toFixed(2)}$`);
-        lines.push(`💰 Estimated cycle volume: $${fallbackVolume.toFixed(2)}`);
-        lines.push(`Cost per 100k: ${costPer100k.toFixed(2)}$`);
-      }
+      lines.push(`${totalEmoji} Total PnL: ${pnlSign}${totalPnl.toFixed(4)}$`);
+      lines.push(`💰 Total Volume: $${totalVolume.toFixed(2)}`);
+      lines.push(` Cost per 100k: ${costPer100k.toFixed(3)}$`);
 
       await sendTg(lines.join('\n'));
     }
@@ -563,7 +589,7 @@ export class DeltaNeutralController {
     }));
   }
 
-  /** Every partial maker fill is immediately matched by a capped FOK taker order. */
+  /** leader-follower: leader LIMIT (maker) → wait full fill → follower MARKET (taker, delta-matched). */
   private async openLeaderFollower(
     srcToken: string,
     limitSide: 'long' | 'short',
@@ -571,28 +597,112 @@ export class DeltaNeutralController {
     limitAccounts: GroupAccount[],
     marketAccounts: GroupAccount[]
   ): Promise<void> {
-    const snapshot = await limitAccounts[0]!.service.getMarketSnapshot(srcToken);
-    const makerTargets = await Promise.all(limitAccounts.map(async (acc) => ({
-      service: acc.service,
-      targetBaseUnits: await acc.service.quantizeBaseUnits(
-        srcToken,
-        (acc.orderAmount ?? 0) / snapshot.midPrice
-      ),
-    })));
-    const makerTotal = makerTargets.reduce((sum, target) => sum + target.targetBaseUnits, 0);
-    const takerTargets = await allocateTargets(
-      makerTotal,
-      marketAccounts.map((acc) => ({ service: acc.service, weight: acc.orderAmount ?? 1 })),
-      srcToken
-    );
+    // Leader places LIMIT orders (parallel)
+    console.log(`\n  📋 ${limitSide.toUpperCase()} placing LIMIT orders...`);
+    const pendingLeader = new Set(limitAccounts);
 
-    await executePaired({
-      symbol: srcToken,
-      makerSide: limitSide,
-      takerSide: marketSide,
-      makerTargets,
-      takerTargets,
+    if (isTradingHalted()) throw new Error('Trading halted by Force Close');
+
+    await Promise.all(limitAccounts.map(async (acc) => {
+      try {
+        await acc.service.placePositionOrder({
+          instrument: srcToken,
+          executionSide: limitSide,
+          executionType: 'limit',
+          amountUsd: acc.orderAmount!,
+        });
+      } catch (e: any) {
+        console.log(`  ❌ LIMIT open failed for ${shortAddr(acc.address)}: ${e.message}`);
+        await this.handleFailure(acc, e);
+      }
+    }));
+
+    // Retry loop for leader: poll every 1s up to 2min, then re-place unfilled
+    console.log(`  ⏳ Waiting for leader fills (checking every 1s, up to 2min)...`);
+    while (pendingLeader.size > 0) {
+      let stillWaiting: GroupAccount[] = [];
+
+      for (let i = 0; i < 120 && pendingLeader.size > 0; i++) {
+        if (isTradingHalted()) throw new Error('Trading halted by Force Close');
+        await sleep(1);
+
+        stillWaiting = [];
+        for (const acc of pendingLeader) {
+          try {
+            const position = await acc.service.getPositionBaseUnits(srcToken);
+            if (position > 1e-10) {
+              console.log(`  ✅ ${shortAddr(acc.address)} leader FILLED`);
+            } else {
+              stillWaiting.push(acc);
+            }
+          } catch {
+            stillWaiting.push(acc);
+          }
+        }
+
+        for (const acc of pendingLeader) {
+          if (!stillWaiting.includes(acc)) pendingLeader.delete(acc);
+        }
+      }
+
+      if (pendingLeader.size === 0) break;
+
+      console.log(`  🔄 ${pendingLeader.size} leader limit(s) unfilled — re-placing...`);
+      await Promise.all(stillWaiting.map(async (acc) => {
+        try {
+          await acc.service.cancelAllOrders(srcToken);
+          await acc.service.placePositionOrder({
+            instrument: srcToken,
+            executionSide: limitSide,
+            executionType: 'limit',
+            amountUsd: acc.orderAmount!,
+          });
+        } catch (e: any) {
+          console.log(`  ⚠️ Leader re-place failed for ${shortAddr(acc.address)}: ${e.message}`);
+        }
+      }));
+    }
+
+    console.log(`  ✅ All leader limits FILLED`);
+
+    // Cancel remnants on leader side
+    await Promise.all(limitAccounts.map(async (acc) => {
+      try { await acc.service.cancelAllOrders(srcToken); } catch { /* ok */ }
+    }));
+
+    // Read actual leader base units for exact delta matching
+    let totalLimitBaseUnits = 0;
+    for (const acc of limitAccounts) {
+      const units = await acc.service.getPositionBaseUnits(srcToken);
+      totalLimitBaseUnits += units;
+      console.log(`  📐 ${shortAddr(acc.address)} leader: ${parseFloat(units.toFixed(6))} ${srcToken}`);
+    }
+    console.log(`  📐 Total LEADER: ${parseFloat(totalLimitBaseUnits.toFixed(6))} ${srcToken}`);
+
+    // Distribute lots proportionally among followers
+    const totalFollowerWeight = marketAccounts.reduce((s, a) => s + (a.orderAmount ?? 1), 0);
+    const followerBaseUnits = marketAccounts.map((a) => {
+      const weight = (a.orderAmount ?? 1) / totalFollowerWeight;
+      return totalLimitBaseUnits * weight;
     });
-  }
 
+    // Follower places MARKET orders (parallel, exact lot matching)
+    console.log(`\n  🚀 ${marketSide.toUpperCase()} placing MARKET orders (delta-matched)...`);
+    if (isTradingHalted()) throw new Error('Trading halted by Force Close');
+    await Promise.all(marketAccounts.map(async (acc, i) => {
+      try {
+        await acc.service.placePositionOrder({
+          instrument: srcToken,
+          executionSide: marketSide,
+          executionType: 'market',
+          amountUsd: acc.orderAmount!,
+          overrideBaseUnits: followerBaseUnits[i],
+        });
+        console.log(`  ✅ ${shortAddr(acc.address)} follower MARKET filled`);
+      } catch (e: any) {
+        console.log(`  ❌ MARKET order failed for ${shortAddr(acc.address)}: ${e.message}`);
+        await this.handleFailure(acc, e);
+      }
+    }));
+  }
 }

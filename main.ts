@@ -14,12 +14,6 @@ import { createInterface } from 'node:readline';
 import { ID_FILTER, SHUFFLE_WALLETS, TOKENS_TO_TRADE } from './settings.js';
 import { DeltaNeutralController } from './modules/controller.js';
 import { closeLeaderFollower } from './modules/close-strategy.js';
-import {
-  collectCycleReport,
-  discoverOpenCycleStart,
-  formatCycleMetrics,
-} from './modules/execution-report.js';
-import { combineCycleMetrics, type CycleMetrics } from './modules/execution-math.js';
 import { PhoenixService } from './modules/phoenix-service.js';
 import { sendTg } from './modules/telegram.js';
 import {
@@ -212,18 +206,6 @@ async function closeAllPositions(services: PhoenixService[]): Promise<void> {
     }
   }
 
-  const cycleStarts = new Map<string, number>();
-  for (const [symbol, entries] of bySymbol) {
-    try {
-      cycleStarts.set(
-        symbol,
-        await discoverOpenCycleStart(entries.map((entry) => entry.service), symbol)
-      );
-    } catch (error: any) {
-      console.log(`  ⚠️ ${symbol} cycle start discovery failed: ${error.message}`);
-    }
-  }
-
   for (const [symbol, entries] of bySymbol) {
     // Leader side = side of the single largest position
     const biggest = entries.reduce((a, b) => (b.positionUsd > a.positionUsd ? b : a));
@@ -232,29 +214,6 @@ async function closeAllPositions(services: PhoenixService[]): Promise<void> {
     const marketAccounts = entries.filter((e) => e.side !== limitSide);
     await closeLeaderFollower(limitAccounts, marketAccounts, symbol);
   }
-
-  const walletCycleMetrics = new Map<string, CycleMetrics[]>();
-  const cycleMetrics: CycleMetrics[] = [];
-  for (const [symbol, entries] of bySymbol) {
-    const startTimeMs = cycleStarts.get(symbol);
-    if (startTimeMs === undefined) continue;
-    try {
-      const report = await collectCycleReport(
-        entries.map((entry) => entry.service),
-        symbol,
-        startTimeMs
-      );
-      cycleMetrics.push(report.metrics);
-      for (const [wallet, metrics] of report.byWallet) {
-        const current = walletCycleMetrics.get(wallet) ?? [];
-        current.push(metrics);
-        walletCycleMetrics.set(wallet, current);
-      }
-    } catch (error: any) {
-      console.log(`  ⚠️ ${symbol} full-cycle report failed: ${error.message}`);
-    }
-  }
-  const fullCycle = cycleMetrics.length > 0 ? combineCycleMetrics(cycleMetrics) : null;
 
   // Step 3: Report per-wallet PnL
   const lines: string[] = ['📂 POSITIONS CLOSED | Force close', ''];
@@ -268,12 +227,9 @@ async function closeAllPositions(services: PhoenixService[]): Promise<void> {
     }
     try {
       const balanceAfter = await s.service.getUsdcBalance();
-      const walletReports = walletCycleMetrics.get(s.addr) ?? [];
-      const walletMetrics = walletReports.length > 0 ? combineCycleMetrics(walletReports) : null;
-      const pnl = walletMetrics?.netPnl ?? (balanceAfter - s.balanceBefore);
-      const volume = walletMetrics?.actualVolume ?? s.volume;
+      const pnl = balanceAfter - s.balanceBefore;
       totalPnl += pnl;
-      totalVolume += volume;
+      totalVolume += s.volume;
 
       if (s.side) {
         const emoji = s.side === 'long' ? '🟢' : '🔴';
@@ -281,8 +237,8 @@ async function closeAllPositions(services: PhoenixService[]): Promise<void> {
         const pnlSign = pnl >= 0 ? '+' : '';
         const pnlEmoji = pnl >= 0 ? '📈' : '📉';
         const line =
-          `${emoji} ${sideLabel} ${s.addr} | ${pnlEmoji} PnL: ${pnlSign}${pnl.toFixed(2)}$ | ` +
-          `Bal: $${balanceAfter.toFixed(2)} | Cycle vol: $${volume.toFixed(2)}`;
+          `${emoji} ${sideLabel} ${s.addr} | ${pnlEmoji} PnL: ${pnlSign}${pnl.toFixed(4)}$ | ` +
+          `Bal: $${balanceAfter.toFixed(2)} | Vol: $${s.volume.toFixed(2)}`;
         console.log(`  ✅ ${line}`);
         lines.push(line);
       } else {
@@ -295,17 +251,14 @@ async function closeAllPositions(services: PhoenixService[]): Promise<void> {
     }
   }
 
+  const costPer100k = totalVolume > 0 ? (-totalPnl / totalVolume) * 100_000 : 0;
+  const pnlSign = totalPnl >= 0 ? '+' : '';
+  const totalEmoji = totalPnl >= 0 ? '📈' : '📉';
+
   lines.push('');
-  if (fullCycle) {
-    lines.push(...formatCycleMetrics(fullCycle));
-  } else {
-    const costPer100k = totalVolume > 0 ? (-totalPnl / totalVolume) * 100_000 : 0;
-    const pnlSign = totalPnl >= 0 ? '+' : '';
-    const totalEmoji = totalPnl >= 0 ? '📈' : '📉';
-    lines.push(`${totalEmoji} Close balance delta: ${pnlSign}${totalPnl.toFixed(2)}$`);
-    lines.push(`💰 Close volume: $${totalVolume.toFixed(2)}`);
-    lines.push(`Cost per 100k: ${costPer100k.toFixed(2)}$`);
-  }
+  lines.push(`${totalEmoji} Total PnL: ${pnlSign}${totalPnl.toFixed(4)}$`);
+  lines.push(`💰 Total Volume: $${totalVolume.toFixed(2)}`);
+  lines.push(` Cost per 100k: ${costPer100k.toFixed(3)}$`);
 
   console.log('\n✅ Close-all complete');
   console.log(lines.join('\n'));

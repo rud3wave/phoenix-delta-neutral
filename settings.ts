@@ -92,14 +92,3 @@ export const SOLANA_RPC_URLS = [
   'https://api.mainnet-beta.solana.com',
   'https://solana-rpc.publicnode.com',
 ];
-
-// --- ПАРНОЕ ИСПОЛНЕНИЕ ---
-// Частичный maker-fill сразу хеджируется второй ногой. Значения ниже заданы
-// консервативно: они ограничивают время открытой дельты, не превращая RPC в спам.
-export const HEDGE_POLL_INTERVAL_MS = 300;
-// Проверяем необходимость requote редко и двигаем ордер только когда BBO ушёл
-// достаточно далеко. Это не таймер обязательной отмены.
-export const MAKER_REQUOTE_INTERVAL_SEC = 20;
-export const MAKER_REQUOTE_THRESHOLD_PERCENT = 0.03;
-export const MAX_MAKER_WAIT_SEC = 180;
-export const MAX_HEDGE_RETRIES = 3;

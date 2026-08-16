@@ -1,169 +1,185 @@
+// ============================================================
+//  CLOSE STRATEGY — Leader LIMIT (maker) then Follower MARKET (taker)
+// ============================================================
+// Shared by the delta-neutral controller (mode 1) and the manual
+// close-all (mode 2) so the close logic never drifts apart.
+// The side holding the single largest position closes first via
+// LIMIT and waits for fills; the opposite side then closes via MARKET.
+// ============================================================
+
 import { EXECUTION_MODE } from '../settings.js';
-import { allocateTargets, executePaired } from './paired-execution.js';
 import { PhoenixService } from './phoenix-service.js';
-import { shortAddr, sleep } from './utils.js';
+import { sleep, shortAddr } from './utils.js';
 
 export interface CloseAccount {
   service: PhoenixService;
 }
 
-async function flattenResiduals(accounts: CloseAccount[], symbol: string): Promise<void> {
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    const residuals = (await Promise.all(accounts.map(async (account) => ({
-      account,
-      position: await account.service.getSignedPositionBaseUnits(symbol).catch(() => Number.NaN),
-    })))).filter(({ position }) => !Number.isFinite(position) || Math.abs(position) > 1e-10);
-    if (residuals.length === 0) return;
-
-    await Promise.all(residuals.map(async ({ account }) => {
-      try {
-        await account.service.cancelAllOrders(symbol, true, true);
-        await account.service.closePositionByMarket(symbol);
-        console.log(`  ${shortAddr(account.service.getAddress())} residual closed via MARKET`);
-      } catch (error: any) {
-        console.log(
-          `  Residual close ${attempt}/3 failed for ` +
-          `${shortAddr(account.service.getAddress())}: ${error.message}`
-        );
-      }
-    }));
-    await sleep(1);
-  }
-
-  const stillOpen = (await Promise.all(accounts.map(async (account) => ({
-    address: shortAddr(account.service.getAddress()),
-    position: await account.service.getSignedPositionBaseUnits(symbol).catch(() => Number.NaN),
-  })))).filter(({ position }) => !Number.isFinite(position) || Math.abs(position) > 1e-10);
-  if (stillOpen.length > 0) {
-    throw new Error(
-      `${symbol} residual positions remain: ` +
-      stillOpen.map(({ address, position }) => `${address}=${position.toFixed(2)}`).join(', ')
-    );
-  }
-}
-
-async function assertStrictCloseComplete(accounts: CloseAccount[], symbol: string): Promise<void> {
-  const residuals = (await Promise.all(accounts.map(async (account) => ({
-    address: shortAddr(account.service.getAddress()),
-    position: await account.service.getSignedPositionBaseUnits(symbol),
-  })))).filter(({ position }) => Math.abs(position) > 1e-10);
-
-  if (residuals.length > 0) {
-    throw new Error(
-      `${symbol} strict paired close left residual positions; MARKET fallback is disabled: ` +
-      residuals.map(({ address, position }) => `${address}=${position.toFixed(2)}`).join(', ')
-    );
-  }
-}
-
-async function closeResidualsByMakerLimit(
-  accounts: CloseAccount[],
-  symbol: string
-): Promise<void> {
-  const positions = (await Promise.all(accounts.map(async (account) => ({
-    service: account.service,
-    position: await account.service.getSignedPositionBaseUnits(symbol),
-  })))).filter(({ position }) => Math.abs(position) > 1e-10);
-
-  for (const makerSide of ['long', 'short'] as const) {
-    const targets = positions
-      .filter(({ position }) => (position < 0 ? 'long' : 'short') === makerSide)
-      .map(({ service, position }) => ({ service, targetBaseUnits: Math.abs(position) }));
-    if (targets.length === 0) continue;
-
-    console.log(`\n  Closing unpaired ${symbol} residual strictly via maker LIMIT...`);
-    await executePaired({
-      symbol,
-      makerSide,
-      takerSide: makerSide === 'long' ? 'short' : 'long',
-      makerTargets: targets,
-      takerTargets: [],
-      reduceOnly: true,
-      haltCheck: () => false,
-      maxMakerWaitSec: null,
-      makerOnly: true,
-    });
-  }
-}
-
+/**
+ * Close positions leader-first:
+ * `limitAccounts` close via LIMIT (maker) with a retry loop until filled,
+ * then `marketAccounts` close via MARKET (taker).
+ */
 export async function closeLeaderFollower(
   limitAccounts: CloseAccount[],
   marketAccounts: CloseAccount[],
   symbol: string
 ): Promise<void> {
-  const all = [...limitAccounts, ...marketAccounts];
-  if (all.length === 0) return;
+  if (limitAccounts.length === 0 && marketAccounts.length === 0) return;
 
-  await Promise.all(all.map((account) => account.service.cancelAllOrders(symbol, true)));
-
+  // ========== all-market: close everything by market at once ==========
   if (EXECUTION_MODE === 'all-market') {
-    console.log(`\n  Closing ${all.length} ${symbol} position(s) via MARKET...`);
-    await flattenResiduals(all, symbol);
+    const all = [...limitAccounts, ...marketAccounts];
+    console.log(`\n  🚀 Closing ALL ${all.length} ${symbol} via MARKET (all-market mode)...`);
+    await Promise.all(all.map(async (acc) => {
+      try {
+        await acc.service.closePositionByMarket(symbol);
+        console.log(`  ✅ ${shortAddr(acc.service.getAddress())} closed via MARKET`);
+      } catch (e: any) {
+        console.log(`  ❌ Market close failed for ${shortAddr(acc.service.getAddress())}: ${e.message}`);
+      }
+    }));
+    console.log(`  ✅ ${symbol} closed (all-market)`);
     return;
   }
+
+  // One-sided residuals close strictly via maker LIMIT (no MARKET leg exists)
   if (limitAccounts.length === 0 || marketAccounts.length === 0) {
-    await closeResidualsByMakerLimit(all, symbol);
-    await assertStrictCloseComplete(all, symbol);
+    const all = [...limitAccounts, ...marketAccounts];
+    console.log(`\n  📋 Closing ${all.length} ${symbol} residual via LIMIT (maker)...`);
+    const pendingClose = new Set(all);
+
+    await Promise.all(all.map(async (acc) => {
+      try {
+        await acc.service.closePositionByLimit(symbol);
+      } catch (e: any) {
+        console.log(`  ⚠️ Limit close failed for ${shortAddr(acc.service.getAddress())}: ${e.message}`);
+      }
+    }));
+
+    let closeRetryCount = 0;
+    while (pendingClose.size > 0) {
+      closeRetryCount++;
+      let stillOpen: CloseAccount[] = [];
+
+      for (let i = 0; i < 120 && pendingClose.size > 0; i++) {
+        await sleep(1);
+
+        stillOpen = [];
+        for (const acc of pendingClose) {
+          try {
+            const position = await acc.service.getPositionBaseUnits(symbol);
+            if (position > 1e-10) {
+              stillOpen.push(acc);
+            } else {
+              console.log(`  ✅ ${shortAddr(acc.service.getAddress())} closed via LIMIT (maker)`);
+            }
+          } catch {
+            stillOpen.push(acc);
+          }
+        }
+
+        for (const acc of pendingClose) {
+          if (!stillOpen.includes(acc)) pendingClose.delete(acc);
+        }
+      }
+
+      if (pendingClose.size === 0) break;
+
+      console.log(`  🔄 ${pendingClose.size} limit(s) unfilled — cancelling & re-placing...`);
+      await Promise.all(stillOpen.map(async (acc) => {
+        try {
+          await acc.service.cancelAllOrders(symbol);
+          await acc.service.closePositionByLimit(symbol);
+        } catch (e: any) {
+          console.log(`  ⚠️ Re-place failed for ${shortAddr(acc.service.getAddress())}: ${e.message}`);
+        }
+      }));
+    }
+
+    await Promise.all(all.map(async (acc) => {
+      try { await acc.service.cancelAllOrders(symbol); } catch { /* ok */ }
+    }));
+    console.log(`  ✅ ${symbol} closed (maker LIMIT)`);
     return;
   }
 
-  const makerPositions = await Promise.all(limitAccounts.map(async (account) => ({
-    service: account.service,
-    position: await account.service.getSignedPositionBaseUnits(symbol),
-  })));
-  const takerPositions = await Promise.all(marketAccounts.map(async (account) => ({
-    service: account.service,
-    position: await account.service.getSignedPositionBaseUnits(symbol),
-  })));
+  // ========== Step 1: Leader LIMIT (maker) ==========
 
-  const makerActive = makerPositions.filter(({ position }) => Math.abs(position) > 1e-10);
-  const takerActive = takerPositions.filter(({ position }) => Math.abs(position) > 1e-10);
-  if (makerActive.length === 0 && takerActive.length === 0) {
-    return;
+  console.log(`\n  📋 Leader (${limitAccounts.length}) closing ${symbol} via LIMIT (maker)...`);
+  const pendingClose = new Set(limitAccounts);
+
+  // Initial placement
+  await Promise.all(limitAccounts.map(async (acc) => {
+    try {
+      await acc.service.closePositionByLimit(symbol);
+    } catch (e: any) {
+      console.log(`  ⚠️ Limit close failed for ${shortAddr(acc.service.getAddress())}: ${e.message}`);
+    }
+  }));
+
+  // Retry loop: poll every 1s up to 2min → re-place unfilled
+  let closeRetryCount = 0;
+
+  while (pendingClose.size > 0) {
+    closeRetryCount++;
+    console.log(`\n  ⏳ Polling leader close fills every 1s, up to 2min (attempt ${closeRetryCount})...`);
+    let stillOpen: CloseAccount[] = [];
+
+    for (let i = 0; i < 120 && pendingClose.size > 0; i++) {
+      await sleep(1);
+
+      stillOpen = [];
+      for (const acc of pendingClose) {
+        try {
+          const position = await acc.service.getPositionBaseUnits(symbol);
+          if (position > 1e-10) {
+            stillOpen.push(acc);
+          } else {
+            console.log(`  ✅ ${shortAddr(acc.service.getAddress())} leader closed via LIMIT (maker)`);
+          }
+        } catch {
+          stillOpen.push(acc);
+        }
+      }
+
+      for (const acc of pendingClose) {
+        if (!stillOpen.includes(acc)) pendingClose.delete(acc);
+      }
+    }
+
+    if (pendingClose.size === 0) break;
+
+    // Re-place unfilled
+    console.log(`  🔄 ${pendingClose.size} leader limit(s) unfilled — cancelling & re-placing...`);
+    await Promise.all(stillOpen.map(async (acc) => {
+      try {
+        await acc.service.cancelAllOrders(symbol);
+        await acc.service.closePositionByLimit(symbol);
+      } catch (e: any) {
+        console.log(`  ⚠️ Re-place failed for ${shortAddr(acc.service.getAddress())}: ${e.message}`);
+      }
+    }));
   }
-  if (makerActive.length === 0 || takerActive.length === 0) {
-    await closeResidualsByMakerLimit(all, symbol);
-    await assertStrictCloseComplete(all, symbol);
-    return;
-  }
 
-  const makerSide = makerActive[0]!.position > 0 ? 'short' : 'long';
-  const takerSide = takerActive[0]!.position > 0 ? 'short' : 'long';
-  if (makerSide === takerSide) {
-    await closeResidualsByMakerLimit(all, symbol);
-    await assertStrictCloseComplete(all, symbol);
-    return;
-  }
+  // Cancel any lingering orders on the leader side
+  await Promise.all(limitAccounts.map(async (acc) => {
+    try { await acc.service.cancelAllOrders(symbol); } catch { /* ok */ }
+  }));
 
-  const makerTotal = makerActive.reduce((sum, entry) => sum + Math.abs(entry.position), 0);
-  const takerTotal = takerActive.reduce((sum, entry) => sum + Math.abs(entry.position), 0);
-  const pairedTotal = Math.min(makerTotal, takerTotal);
+  console.log(`  ✅ Leader closed via LIMIT (maker) after ${closeRetryCount} attempt(s)`);
 
-  const [makerTargets, takerTargets] = await Promise.all([
-    allocateTargets(
-      pairedTotal,
-      makerActive.map((entry) => ({ service: entry.service, weight: Math.abs(entry.position) })),
-      symbol
-    ),
-    allocateTargets(
-      pairedTotal,
-      takerActive.map((entry) => ({ service: entry.service, weight: Math.abs(entry.position) })),
-      symbol
-    ),
-  ]);
+  // ========== Step 2: Follower MARKET (taker) ==========
 
-  console.log(`\n  Closing ${symbol} strictly via leader LIMIT -> follower MARKET...`);
-  await executePaired({
-    symbol,
-    makerSide,
-    takerSide,
-    makerTargets,
-    takerTargets,
-    reduceOnly: true,
-    // Force Close blocks new risk, but this close must keep working until the maker fills.
-    haltCheck: () => false,
-    maxMakerWaitSec: null,
-  });
-  await closeResidualsByMakerLimit(all, symbol);
-  await assertStrictCloseComplete(all, symbol);
+  console.log(`\n  🚀 Follower (${marketAccounts.length}) closing ${symbol} via MARKET (taker)...`);
+  await Promise.all(marketAccounts.map(async (acc) => {
+    try {
+      await acc.service.closePositionByMarket(symbol);
+      console.log(`  ✅ ${shortAddr(acc.service.getAddress())} follower closed via MARKET`);
+    } catch (e: any) {
+      console.log(`  ❌ Market close failed for ${shortAddr(acc.service.getAddress())}: ${e.message}`);
+    }
+  }));
+
+  console.log(`  ✅ ${symbol} closed (leader LIMIT + follower MARKET)`);
 }

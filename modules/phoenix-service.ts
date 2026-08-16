@@ -549,6 +549,17 @@ export class PhoenixService {
     return lots / Math.pow(10, decimals);
   }
 
+  // Read position size in base units (ETH, SOL, etc.)
+  public async getPositionBaseUnits(symbol: string): Promise<number> {
+    const state = await this.getPositions();
+    const position = this.findPosition(state, symbol);
+    if (!position) return 0;
+
+    await this.getBaseLotsDecimals(symbol);
+    const rawLots = Math.abs(Number(position.basePositionLots));
+    return this.lotsToBaseUnits(rawLots, symbol);
+  }
+
   public async getSignedPositionBaseUnits(symbol: string): Promise<number> {
     const state = await this.getPositions();
     const position = this.findPosition(state, symbol);
@@ -675,7 +686,32 @@ export class PhoenixService {
     }
   }
 
-  // ==================== CLOSE BY MARKET ====================
+  // ==================== CLOSE BY LIMIT / MARKET ====================
+
+  public async closePositionByLimit(symbol: string): Promise<void> {
+    const state = await this.getPositions();
+    const position = this.findPosition(state, symbol);
+
+    if (!position) {
+      console.log(`  ℹ️ No open position for ${symbol} to close`);
+      return;
+    }
+
+    await this.getBaseLotsDecimals(symbol);
+    const baseUnits = this.lotsToBaseUnits(Math.abs(Number(position.basePositionLots)), symbol);
+    const closeSide = Number(position.basePositionLots) > 0 ? 'short' : 'long';
+
+    console.log(`  📋 Closing ${symbol} via LIMIT | ${closeSide.toUpperCase()} | ${parseFloat(baseUnits.toFixed(6))} ${symbol}`);
+
+    await this.placePositionOrder({
+      instrument: symbol,
+      executionSide: closeSide as 'long' | 'short',
+      executionType: 'limit',
+      amountUsd: 0,
+      overrideBaseUnits: baseUnits,
+      reduceOnly: true,
+    });
+  }
 
   public async closePositionByMarket(symbol: string): Promise<void> {
     const state = await this.getPositions();
@@ -690,7 +726,7 @@ export class PhoenixService {
     const baseUnits = this.lotsToBaseUnits(Math.abs(Number(position.basePositionLots)), symbol);
     const closeSide = Number(position.basePositionLots) > 0 ? 'short' : 'long';
 
-    console.log(`  🚀 Closing ${symbol} via MARKET | ${closeSide.toUpperCase()} | ${baseUnits.toFixed(2)} ${symbol}`);
+    console.log(`  🚀 Closing ${symbol} via MARKET | ${closeSide.toUpperCase()} | ${parseFloat(baseUnits.toFixed(6))} ${symbol}`);
 
     await this.placePositionOrder({
       instrument: symbol,

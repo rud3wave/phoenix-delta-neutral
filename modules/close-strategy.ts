@@ -1,17 +1,19 @@
 // ============================================================
-//  CLOSE STRATEGY — Leader LIMIT (maker) then Follower close
+//  CLOSE STRATEGY — both sides close via LIMIT simultaneously
 // ============================================================
 // Shared by the delta-neutral controller (mode 1) and the manual
 // close-all (mode 2) so the close logic never drifts apart.
-// The side holding the single largest position closes first via
-// LIMIT and waits for fills; the opposite side then tries a short
-// maker-close and falls back to MARKET after MAKER_CLOSE_TIMEOUT_SEC.
+// Обе стороны одновременно ставят закрывающие лимитки на тач
+// (мейкер) и переставляют незаполненные каждые REQUOTE_INTERVAL_SEC.
+// Если одна сторона закрылась полностью, а вторая отстаёт дольше
+// ONE_SIDED_CLOSE_TIMEOUT_SEC — отстающая закрывается маркетом,
+// чтобы не стоять голым.
 // ============================================================
 
 import {
   EXECUTION_MODE,
   FILL_POLL_INTERVAL_MS,
-  MAKER_CLOSE_TIMEOUT_SEC,
+  ONE_SIDED_CLOSE_TIMEOUT_SEC,
   REQUOTE_INTERVAL_SEC,
 } from '../settings.js';
 import { PhoenixService } from './phoenix-service.js';
@@ -36,19 +38,57 @@ async function closeByMarketWithRetry(acc: CloseAccount, symbol: string, attempt
   throw lastError;
 }
 
-/** Один раунд ожидания: быстрый опрос позиций до 2 минут. */
-async function waitUntilClosed(
+async function placeLimits(accounts: Iterable<CloseAccount>, symbol: string): Promise<void> {
+  await Promise.all([...accounts].map(async (acc) => {
+    try {
+      await acc.service.closePositionByLimit(symbol);
+    } catch (e: any) {
+      console.log(`  ⚠️ Limit close failed for ${shortAddr(acc.service.getAddress())}: ${e.message}`);
+    }
+  }));
+}
+
+async function rePlace(accounts: Iterable<CloseAccount>, symbol: string): Promise<void> {
+  await Promise.all([...accounts].map(async (acc) => {
+    try {
+      await acc.service.cancelAllOrders(symbol);
+      await acc.service.closePositionByLimit(symbol);
+    } catch (e: any) {
+      console.log(`  ⚠️ Re-place failed for ${shortAddr(acc.service.getAddress())}: ${e.message}`);
+    }
+  }));
+}
+
+async function cancelAll(accounts: CloseAccount[], symbol: string): Promise<void> {
+  await Promise.all(accounts.map(async (acc) => {
+    try { await acc.service.cancelAllOrders(symbol); } catch { /* ok */ }
+  }));
+}
+
+async function marketCloseAll(accounts: CloseAccount[], symbol: string): Promise<void> {
+  await Promise.all(accounts.map(async (acc) => {
+    try {
+      await acc.service.cancelAllOrders(symbol);
+      await closeByMarketWithRetry(acc, symbol);
+      console.log(`  ✅ ${shortAddr(acc.service.getAddress())} closed via MARKET (fallback)`);
+    } catch (e: any) {
+      console.log(`  ❌ Market close failed for ${shortAddr(acc.service.getAddress())}: ${e.message}`);
+    }
+  }));
+}
+
+/** Один раунд быстрого опроса позиций (параллельно), строго до deadline. */
+async function pollRound(
   pending: Set<CloseAccount>,
   symbol: string,
+  deadline: number,
   onFilled: (acc: CloseAccount) => void
-): Promise<CloseAccount[]> {
+): Promise<void> {
   const pollSec = FILL_POLL_INTERVAL_MS / 1000;
   const roundStart = Date.now();
-  const roundDeadline = roundStart + REQUOTE_INTERVAL_SEC * 1000;
   let lastLogAt = 0;
-  let stillOpen: CloseAccount[] = [];
 
-  while (pending.size > 0 && Date.now() < roundDeadline) {
+  while (pending.size > 0 && Date.now() < deadline) {
     await sleep(pollSec);
 
     const results = await Promise.all([...pending].map(async (acc) => {
@@ -60,14 +100,10 @@ async function waitUntilClosed(
       }
     }));
 
-    stillOpen = [];
     for (const { acc, open } of results) {
-      if (open) {
-        stillOpen.push(acc);
-      } else {
-        onFilled(acc);
-        pending.delete(acc);
-      }
+      if (open) continue;
+      onFilled(acc);
+      pending.delete(acc);
     }
 
     const now = Date.now();
@@ -79,14 +115,12 @@ async function waitUntilClosed(
       );
     }
   }
-
-  return stillOpen;
 }
 
 /**
- * Close positions leader-first:
- * `limitAccounts` close via LIMIT (maker) with a retry loop until filled,
- * then `marketAccounts` try a timed maker-close and fall back to MARKET.
+ * Close positions: обе стороны закрываются лимитками одновременно (мейкер).
+ * `limitAccounts` / `marketAccounts` — исторические имена сторон группы;
+ * при закрытии обе работают как мейкер.
  */
 export async function closeLeaderFollower(
   limitAccounts: CloseAccount[],
@@ -111,162 +145,93 @@ export async function closeLeaderFollower(
     return;
   }
 
-  // One-sided residuals close strictly via maker LIMIT (no MARKET leg exists)
+  const all = [...limitAccounts, ...marketAccounts];
+  const nakedTimeoutMs = ONE_SIDED_CLOSE_TIMEOUT_SEC > 0
+    ? ONE_SIDED_CLOSE_TIMEOUT_SEC * 1000
+    : Number.POSITIVE_INFINITY;
+
+  // ========== One-sided residuals: maker LIMIT, timed market fallback ==========
   if (limitAccounts.length === 0 || marketAccounts.length === 0) {
-    const all = [...limitAccounts, ...marketAccounts];
     console.log(`\n  📋 Closing ${all.length} ${symbol} residual via LIMIT (maker)...`);
     const pendingClose = new Set(all);
-
-    await Promise.all(all.map(async (acc) => {
-      try {
-        await acc.service.closePositionByLimit(symbol);
-      } catch (e: any) {
-        console.log(`  ⚠️ Limit close failed for ${shortAddr(acc.service.getAddress())}: ${e.message}`);
-      }
-    }));
+    await placeLimits(pendingClose, symbol);
 
     let closeRetryCount = 0;
     while (pendingClose.size > 0) {
       closeRetryCount++;
-      await waitUntilClosed(pendingClose, symbol, (acc) => {
+      const roundDeadline = Math.min(
+        Date.now() + REQUOTE_INTERVAL_SEC * 1000,
+        Date.now() + nakedTimeoutMs
+      );
+      await pollRound(pendingClose, symbol, roundDeadline, (acc) => {
         console.log(`  ✅ ${shortAddr(acc.service.getAddress())} closed via LIMIT (maker)`);
       });
 
       if (pendingClose.size === 0) break;
 
-      console.log(`  🔄 ${pendingClose.size} limit(s) unfilled — cancelling & re-placing...`);
-      await Promise.all([...pendingClose].map(async (acc) => {
-        try {
-          await acc.service.cancelAllOrders(symbol);
-          await acc.service.closePositionByLimit(symbol);
-        } catch (e: any) {
-          console.log(`  ⚠️ Re-place failed for ${shortAddr(acc.service.getAddress())}: ${e.message}`);
-        }
-      }));
+      if (nakedTimeoutMs !== Number.POSITIVE_INFINITY && Date.now() >= roundDeadline) {
+        console.log(`  🔄 Residual unfilled in ${ONE_SIDED_CLOSE_TIMEOUT_SEC}s — MARKET fallback...`);
+        await marketCloseAll([...pendingClose], symbol);
+        break;
+      }
+
+      console.log(`  🔄 ${pendingClose.size} limit(s) unfilled — cancelling & re-placing (attempt ${closeRetryCount})...`);
+      await rePlace(pendingClose, symbol);
     }
 
-    await Promise.all(all.map(async (acc) => {
-      try { await acc.service.cancelAllOrders(symbol); } catch { /* ok */ }
-    }));
+    await cancelAll(all, symbol);
     console.log(`  ✅ ${symbol} closed (maker LIMIT)`);
     return;
   }
 
-  // ========== Step 1: Leader LIMIT (maker) ==========
+  // ========== Both sides LIMIT simultaneously ==========
+  console.log(
+    `\n  📋 Closing BOTH sides via LIMIT (maker): ` +
+    `${limitAccounts.length} + ${marketAccounts.length} ${symbol}...`
+  );
+  const pending = new Set(all);
+  await placeLimits(pending, symbol);
 
-  console.log(`\n  📋 Leader (${limitAccounts.length}) closing ${symbol} via LIMIT (maker)...`);
-  const pendingClose = new Set(limitAccounts);
-
-  // Initial placement
-  await Promise.all(limitAccounts.map(async (acc) => {
-    try {
-      await acc.service.closePositionByLimit(symbol);
-    } catch (e: any) {
-      console.log(`  ⚠️ Limit close failed for ${shortAddr(acc.service.getAddress())}: ${e.message}`);
-    }
-  }));
-
-  // Retry loop: poll fast up to 2min → re-place unfilled
   let closeRetryCount = 0;
+  let oneSidedSince: number | null = null;
 
-  while (pendingClose.size > 0) {
+  while (pending.size > 0) {
     closeRetryCount++;
-    console.log(`\n  ⏳ Polling leader close fills every ${FILL_POLL_INTERVAL_MS}ms, up to ${REQUOTE_INTERVAL_SEC}s (attempt ${closeRetryCount})...`);
+    const roundStart = Date.now();
+    const roundDeadline = roundStart + REQUOTE_INTERVAL_SEC * 1000;
 
-    await waitUntilClosed(pendingClose, symbol, (acc) => {
-      console.log(`  ✅ ${shortAddr(acc.service.getAddress())} leader closed via LIMIT (maker)`);
+    await pollRound(pending, symbol, roundDeadline, (acc) => {
+      console.log(`  ✅ ${shortAddr(acc.service.getAddress())} closed via LIMIT (maker)`);
     });
 
-    if (pendingClose.size === 0) break;
+    if (pending.size === 0) break;
 
-    // Re-place unfilled
-    console.log(`  🔄 ${pendingClose.size} leader limit(s) unfilled — cancelling & re-placing...`);
-    await Promise.all([...pendingClose].map(async (acc) => {
-      try {
-        await acc.service.cancelAllOrders(symbol);
-        await acc.service.closePositionByLimit(symbol);
-      } catch (e: any) {
-        console.log(`  ⚠️ Re-place failed for ${shortAddr(acc.service.getAddress())}: ${e.message}`);
-      }
-    }));
-  }
-
-  // Cancel any lingering orders on the leader side
-  await Promise.all(limitAccounts.map(async (acc) => {
-    try { await acc.service.cancelAllOrders(symbol); } catch { /* ok */ }
-  }));
-
-  console.log(`  ✅ Leader closed via LIMIT (maker) after ${closeRetryCount} attempt(s)`);
-
-  // ========== Step 2: Follower — timed maker close, MARKET fallback ==========
-
-  if (MAKER_CLOSE_TIMEOUT_SEC <= 0) {
-    console.log(`\n  🚀 Follower (${marketAccounts.length}) closing ${symbol} via MARKET (taker)...`);
-    await Promise.all(marketAccounts.map(async (acc) => {
-      try {
-        await closeByMarketWithRetry(acc, symbol);
-        console.log(`  ✅ ${shortAddr(acc.service.getAddress())} follower closed via MARKET`);
-      } catch (e: any) {
-        console.log(`  ❌ Market close failed for ${shortAddr(acc.service.getAddress())}: ${e.message}`);
-      }
-    }));
-    console.log(`  ✅ ${symbol} closed (leader LIMIT + follower MARKET)`);
-    return;
-  }
-
-  console.log(`\n  📋 Follower (${marketAccounts.length}) closing ${symbol} via LIMIT (maker, up to ${MAKER_CLOSE_TIMEOUT_SEC}s)...`);
-  await Promise.all(marketAccounts.map(async (acc) => {
-    try {
-      await acc.service.closePositionByLimit(symbol);
-    } catch (e: any) {
-      console.log(`  ⚠️ Limit close failed for ${shortAddr(acc.service.getAddress())}: ${e.message}`);
-    }
-  }));
-
-  const pendingFollower = new Set(marketAccounts);
-  const deadline = Date.now() + MAKER_CLOSE_TIMEOUT_SEC * 1000;
-  const pollSec = FILL_POLL_INTERVAL_MS / 1000;
-
-  while (pendingFollower.size > 0 && Date.now() < deadline) {
-    await sleep(pollSec);
-
-    const stillOpen: CloseAccount[] = [];
-    for (const acc of pendingFollower) {
-      try {
-        const position = await acc.service.getPositionBaseUnits(symbol);
-        if (position > 1e-10) {
-          stillOpen.push(acc);
-        } else {
-          console.log(`  ✅ ${shortAddr(acc.service.getAddress())} follower closed via LIMIT (maker)`);
-        }
-      } catch {
-        stillOpen.push(acc);
-      }
+    // Односторонность: одна сторона закрылась полностью, вторая ещё нет.
+    // Пока открыты обе — портфель хеджирован, таймер не идёт.
+    const limitOpen = limitAccounts.some((acc) => pending.has(acc));
+    const marketOpen = marketAccounts.some((acc) => pending.has(acc));
+    if (limitOpen !== marketOpen) {
+      oneSidedSince ??= Date.now();
+    } else {
+      oneSidedSince = null;
     }
 
-    for (const acc of pendingFollower) {
-      if (!stillOpen.includes(acc)) pendingFollower.delete(acc);
+    if (oneSidedSince !== null && Date.now() - oneSidedSince >= nakedTimeoutMs) {
+      const laggards = [...pending];
+      console.log(
+        `  🔄 One-sided for ${ONE_SIDED_CLOSE_TIMEOUT_SEC}s — ` +
+        `MARKET closing ${laggards.length} laggard(s)...`
+      );
+      await marketCloseAll(laggards, symbol);
+      for (const acc of laggards) pending.delete(acc);
+      oneSidedSince = null;
+      if (pending.size === 0) break;
     }
+
+    console.log(`  🔄 ${pending.size} limit(s) unfilled — cancelling & re-placing (attempt ${closeRetryCount})...`);
+    await rePlace(pending, symbol);
   }
 
-  // Не успела закрыться мейкером — дочищаем маркетом
-  if (pendingFollower.size > 0) {
-    console.log(`  🔄 ${pendingFollower.size} follower limit(s) unfilled in ${MAKER_CLOSE_TIMEOUT_SEC}s — MARKET fallback...`);
-    await Promise.all([...pendingFollower].map(async (acc) => {
-      try {
-        await acc.service.cancelAllOrders(symbol);
-        await closeByMarketWithRetry(acc, symbol);
-        console.log(`  ✅ ${shortAddr(acc.service.getAddress())} follower closed via MARKET (fallback)`);
-      } catch (e: any) {
-        console.log(`  ❌ Market close failed for ${shortAddr(acc.service.getAddress())}: ${e.message}`);
-      }
-    }));
-  }
-
-  // Cancel any lingering orders on the follower side
-  await Promise.all(marketAccounts.map(async (acc) => {
-    try { await acc.service.cancelAllOrders(symbol); } catch { /* ok */ }
-  }));
-
-  console.log(`  ✅ ${symbol} closed (leader LIMIT + follower maker/market)`);
+  await cancelAll(all, symbol);
+  console.log(`  ✅ ${symbol} closed (both sides maker LIMIT)`);
 }

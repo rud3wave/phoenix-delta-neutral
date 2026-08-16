@@ -279,56 +279,21 @@ export class DeltaNeutralController {
       console.log(`\n  ✅ Group ${group.id} cycle completed`);
     } catch (e: any) {
       console.log(`\n  ❌ Strategy failed: ${e.message}`);
-      console.log('  🚨 Emergency cleanup via LIMIT (maker)...');
-
-      // Close all via limit with retry loop (same as normal close)
-      const pendingCleanup = new Set(accounts);
-
-      // Initial limit placement
-      await Promise.all(accounts.map(async (acc) => {
-        try {
-          await acc.service.closePositionByLimit(srcToken);
-        } catch {
-          // best effort
-        }
-      }));
-
-      // Retry until all closed: poll every 1s up to 2min, then re-place unfilled
-      while (pendingCleanup.size > 0) {
-        let stillOpen: GroupAccount[] = [];
-
-        for (let i = 0; i < 120 && pendingCleanup.size > 0; i++) {
-          await sleep(1);
-
-          stillOpen = [];
-          for (const acc of pendingCleanup) {
-            try {
-              const position = await acc.service.getPositionBaseUnits(srcToken);
-              if (position > 1e-10) stillOpen.push(acc);
-            } catch {
-              stillOpen.push(acc);
-            }
-          }
-
-          for (const acc of pendingCleanup) {
-            if (!stillOpen.includes(acc)) pendingCleanup.delete(acc);
-          }
-        }
-
-        if (pendingCleanup.size === 0) break;
-
-        // Re-place unfilled
-        await Promise.all(stillOpen.map(async (acc) => {
-          try {
-            await acc.service.cancelAllOrders(srcToken);
-            await acc.service.closePositionByLimit(srcToken);
-          } catch {
-            // best effort
-          }
-        }));
+      console.log('  🚨 Closing positions: leader LIMIT → follower MARKET...');
+      try {
+        // Та же схема, что и штатное закрытие: лидер — лимитки, вторая сторона — маркет
+        const biggest = [...accounts].sort((a, b) => (b.orderAmount ?? 0) - (a.orderAmount ?? 0))[0];
+        const limitSide = biggest?.side ?? 'long';
+        const marketSide = limitSide === 'long' ? 'short' : 'long';
+        await closeLeaderFollower(
+          accounts.filter((acc) => acc.side === limitSide),
+          accounts.filter((acc) => acc.side === marketSide),
+          srcToken
+        );
+        console.log('  ✅ Cleanup complete');
+      } catch (cleanupError: any) {
+        console.log(`  ⚠️ Cleanup incomplete: ${cleanupError.message}`);
       }
-
-      console.log('  ✅ Emergency cleanup complete (maker)');
 
       for (const acc of accounts) {
         await this.handleFailure(acc, e);

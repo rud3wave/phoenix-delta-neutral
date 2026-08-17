@@ -230,6 +230,8 @@ async function closeAllPositions(services: PhoenixService[]): Promise<void> {
   let totalPnl = 0;
   let totalVolume = 0;
   let totalFees = 0;
+  let totalFeesOpen = 0;
+  let totalFeesClose = 0;
   let totalFunding = 0;
   let costsSeen = 0;
 
@@ -248,6 +250,8 @@ async function closeAllPositions(services: PhoenixService[]): Promise<void> {
         try {
           const costs = await s.service.getLastCycleCosts(sym);
           totalFees += costs.fees;
+          totalFeesOpen += costs.feesOpen;
+          totalFeesClose += costs.feesClose;
           totalFunding += costs.funding;
           costsSeen++;
         } catch {
@@ -284,7 +288,10 @@ async function closeAllPositions(services: PhoenixService[]): Promise<void> {
   lines.push(`💰 Total Volume: $${totalVolume.toFixed(2)}`);
   if (costsSeen > 0) {
     const fundingSign = totalFunding >= 0 ? '+' : '';
-    lines.push(`💸 Fees: -${totalFees.toFixed(4)}$ | Funding: ${fundingSign}${totalFunding.toFixed(4)}$`);
+    lines.push(
+      `💸 Fees: -${totalFees.toFixed(4)}$ (open: -${totalFeesOpen.toFixed(4)}$, close: -${totalFeesClose.toFixed(4)}$) | ` +
+      `Funding: ${fundingSign}${totalFunding.toFixed(4)}$`
+    );
   }
   lines.push(` Cost per 100k: ${costPer100k.toFixed(3)}$`);
 

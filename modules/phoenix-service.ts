@@ -804,11 +804,14 @@ export class PhoenixService {
       .reduce((sum, [, size]) => sum + size, 0);
   }
 
-  /** Расходы последнего цикла по символу: комиссии + funding.
+  /** Расходы последнего цикла по символу: комиссии (раздельно открытие/закрытие) + funding.
    * Старт цикла ищем в истории филлов: новейший филл с baseLotsBefore == 0 —
    * это открытие позиции из флэта; суммируем всё с этого момента.
+   * Филл относится к открытию, если |baseLots| вырос, иначе к закрытию.
    * Работает и для открытой, и для только что закрытой позиции. */
-  public async getLastCycleCosts(symbol: string): Promise<{ fees: number; funding: number }> {
+  public async getLastCycleCosts(
+    symbol: string
+  ): Promise<{ fees: number; feesOpen: number; feesClose: number; funding: number }> {
     const fills = await this.apiClient.getTraderTradesHistory(
       this.walletAddress,
       { marketSymbol: symbol, limit: 100 }
@@ -824,11 +827,18 @@ export class PhoenixService {
       }
     }
     since ??= sorted.length > 0 ? toMs(sorted[0]!.timestamp) : null;
-    if (since === null) return { fees: 0, funding: 0 };
+    if (since === null) return { fees: 0, feesOpen: 0, feesClose: 0, funding: 0 };
 
-    const fees = sorted
-      .filter((f) => toMs(f.timestamp) >= since!)
-      .reduce((sum, f) => sum + Math.abs(parseFloat(f.fees) || 0), 0);
+    let feesOpen = 0;
+    let feesClose = 0;
+    for (const f of sorted) {
+      if (toMs(f.timestamp) < since) continue;
+      const fee = Math.abs(parseFloat(f.fees) || 0);
+      const before = Math.abs(parseFloat(f.baseLotsBefore) || 0);
+      const after = Math.abs(parseFloat(f.baseLotsAfter) || 0);
+      if (after > before) feesOpen += fee;
+      else feesClose += fee;
+    }
 
     const funding = await this.apiClient.getTraderFundingHistory(
       this.walletAddress,
@@ -838,7 +848,7 @@ export class PhoenixService {
       .filter((e) => toMs(e.timestamp) >= since!)
       .reduce((sum, e) => sum + (parseFloat(e.fundingPayment) || 0), 0);
 
-    return { fees, funding: fundingSum };
+    return { fees: feesOpen + feesClose, feesOpen, feesClose, funding: fundingSum };
   }
 
   public async waitForSpread(

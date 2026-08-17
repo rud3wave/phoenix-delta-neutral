@@ -547,12 +547,16 @@ export class DeltaNeutralController {
       }
 
       let totalFees = 0;
+      let totalFeesOpen = 0;
+      let totalFeesClose = 0;
       let totalFunding = 0;
       let costsSeen = 0;
       for (const acc of accounts) {
         try {
           const costs = await acc.service.getLastCycleCosts(srcToken);
           totalFees += costs.fees;
+          totalFeesOpen += costs.feesOpen;
+          totalFeesClose += costs.feesClose;
           totalFunding += costs.funding;
           costsSeen++;
         } catch {
@@ -569,7 +573,10 @@ export class DeltaNeutralController {
       lines.push(`💰 Total Volume: $${totalVolume.toFixed(2)}`);
       if (costsSeen > 0) {
         const fundingSign = totalFunding >= 0 ? '+' : '';
-        lines.push(`💸 Fees: -${totalFees.toFixed(4)}$ | Funding: ${fundingSign}${totalFunding.toFixed(4)}$`);
+        lines.push(
+          `💸 Fees: -${totalFees.toFixed(4)}$ (open: -${totalFeesOpen.toFixed(4)}$, close: -${totalFeesClose.toFixed(4)}$) | ` +
+          `Funding: ${fundingSign}${totalFunding.toFixed(4)}$`
+        );
       }
       lines.push(` Cost per 100k: ${costPer100k.toFixed(3)}$`);
 

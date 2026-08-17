@@ -123,6 +123,6 @@ export const SLIPPAGE = 0.02;
 // тот же запрос автоматически уходит на следующий из списка.
 // Свой RPC (Helius, QuickNode, Triton...) вписывай ПЕРВЫМ — станет основным.
 export const SOLANA_RPC_URLS = [
-  'https://api.mainnet-beta.solana.com',
   'https://solana-rpc.publicnode.com',
+  'https://api.mainnet-beta.solana.com',
 ];

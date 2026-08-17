@@ -23,6 +23,10 @@ import {
 import { PhoenixService } from './phoenix-service.js';
 import { sleep, shortAddr, shortError } from './utils.js';
 
+// Режим из settings.ts, расширенный до string: от опечаток страхует
+// проверка при старте (main.ts), а не тип в пользовательском файле.
+const mode: string = EXECUTION_MODE;
+
 export interface CloseAccount {
   service: PhoenixService;
 }
@@ -204,10 +208,10 @@ export async function closeLeaderFollower(
 ): Promise<void> {
   if (limitAccounts.length === 0 && marketAccounts.length === 0) return;
 
-  // ========== all-market: close everything by market at once ==========
-  if (EXECUTION_MODE === 'all-market') {
+  // ========== market: close everything by market at once ==========
+  if (mode === 'market') {
     const all = [...limitAccounts, ...marketAccounts];
-    console.log(`\n  🚀 Closing ALL ${all.length} ${symbol} via MARKET (all-market mode)...`);
+    console.log(`\n  🚀 Closing ALL ${all.length} ${symbol} via MARKET (market mode)...`);
     await Promise.all(all.map(async (acc) => {
       try {
         await closeByMarketWithRetry(acc, symbol);
@@ -216,7 +220,7 @@ export async function closeLeaderFollower(
         console.log(`  ❌ Market close failed for ${shortAddr(acc.service.getAddress())}: ${shortError(e)}`);
       }
     }));
-    console.log(`  ✅ ${symbol} closed (all-market)`);
+    console.log(`  ✅ ${symbol} closed (market)`);
     return;
   }
 

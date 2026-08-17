@@ -1,10 +1,14 @@
 // ============================================================
 //  CONTROLLER — Delta-neutral strategy execution
 // ============================================================
-// Leader-follower: leader side places LIMIT (maker) → poll fills
-// every 1s (re-place after 2min) → follower side hits MARKET (taker)
-// with the exact leader lots.
-// Close: leader LIMIT (maker) → follower MARKET (taker).
+// Open (по EXECUTION_MODE):
+//   limit           — обе стороны ставят LIMIT одновременно (maker),
+//                     при односторонности отстающая — MARKET (open-strategy.ts)
+//   leader-follower — leader LIMIT (maker) → poll fills (re-place after 2min)
+//                     → follower MARKET (taker) with the exact leader lots
+//   market          — всё MARKET сразу
+// Close: обе стороны LIMIT одновременно (maker), при односторонности
+// отстающая — MARKET (close-strategy.ts).
 // Two TG messages: #1 after open, #2 after close with PnL.
 // ============================================================
 
@@ -26,6 +30,7 @@ import {
 import { planTopUp } from './allocation.js';
 import { PhoenixService } from './phoenix-service.js';
 import { closeLeaderFollower } from './close-strategy.js';
+import { openBothSidesLimit } from './open-strategy.js';
 import { isTradingHalted } from './runtime-control.js';
 import { sendTg } from './telegram.js';
 import {
@@ -41,6 +46,10 @@ import {
 
 // Max proxy rotations per wallet before failures start counting
 const MAX_PROXY_ROTATIONS = 2;
+
+// Режим из settings.ts, расширенный до string: от опечаток страхует
+// проверка при старте (main.ts), а не тип в пользовательском файле.
+const execMode: string = EXECUTION_MODE;
 
 // ==================== TYPES ====================
 
@@ -412,13 +421,22 @@ export class DeltaNeutralController {
     const limitAccounts = accounts.filter((a) => a.side === limitSide);
     const marketAccounts = accounts.filter((a) => a.side === marketSide);
 
-    console.log(`\n  🎯 LEADER: ${limitSide.toUpperCase()} (${limitAccounts.length}) via LIMIT | FOLLOWER: ${marketSide.toUpperCase()} (${marketAccounts.length}) via MARKET`);
-
     // ========== OPEN ==========
-    if (EXECUTION_MODE === 'all-market') {
+    if (execMode === 'market') {
       group.opened = true;
       await this.openAllMarket(accounts, srcToken);
+    } else if (execMode === 'limit') {
+      await openBothSidesLimit(
+        accounts.map((acc) => ({
+          service: acc.service,
+          side: acc.side!,
+          orderAmount: acc.orderAmount ?? 0,
+        })),
+        srcToken,
+        () => { group.opened = true; }
+      );
     } else {
+      console.log(`\n  🎯 LEADER: ${limitSide.toUpperCase()} (${limitAccounts.length}) via LIMIT | FOLLOWER: ${marketSide.toUpperCase()} (${marketAccounts.length}) via MARKET`);
       await this.openLeaderFollower(group, srcToken, limitSide, marketSide, limitAccounts, marketAccounts);
     }
 
@@ -512,7 +530,7 @@ export class DeltaNeutralController {
       return;
     }
 
-    // ========== CLOSE — Leader LIMIT first, then Follower MARKET ==========
+    // ========== CLOSE — обе стороны LIMIT одновременно, при односторонности MARKET ==========
     await closeLeaderFollower(limitAccounts, marketAccounts, srcToken);
 
     // ========== TG #2: POSITIONS CLOSED + PnL ==========
@@ -586,10 +604,10 @@ export class DeltaNeutralController {
 
   // ==================== OPEN VARIANTS ====================
 
-  /** all-market: open every wallet by market at once (no maker/taker split). */
+  /** market: open every wallet by market at once (no maker/taker split). */
   private async openAllMarket(accounts: GroupAccount[], srcToken: string): Promise<void> {
     if (isTradingHalted()) throw new Error('Trading halted by Force Close');
-    console.log(`\n  🚀 ALL-MARKET mode — opening ALL ${accounts.length} via MARKET...`);
+    console.log(`\n  🚀 MARKET mode — opening ALL ${accounts.length} via MARKET...`);
     await Promise.all(accounts.map(async (acc) => {
       try {
         if (isTradingHalted()) throw new Error('Trading halted by Force Close');

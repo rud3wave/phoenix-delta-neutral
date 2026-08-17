@@ -11,7 +11,7 @@
 
 import { createInterface } from 'node:readline';
 
-import { ID_FILTER, SHUFFLE_WALLETS, TOKENS_TO_TRADE } from './settings.js';
+import { EXECUTION_MODE, ID_FILTER, SHUFFLE_WALLETS, TOKENS_TO_TRADE } from './settings.js';
 import { DeltaNeutralController } from './modules/controller.js';
 import { closeLeaderFollower } from './modules/close-strategy.js';
 import { PhoenixService } from './modules/phoenix-service.js';
@@ -159,8 +159,6 @@ async function runDeltaNeutral(services: PhoenixService[]): Promise<void> {
       console.log(`  ⚠️ ${shortAddr(service.getAddress())} ${symbol} stale-order cleanup: ${e.message}`);
     }
   })));
-
-  await sendTg(`BOT STARTED | ${services.length} wallet(s) | Delta-neutral mode`);
 
   // Run the controller loop
   try {
@@ -476,8 +474,21 @@ function setupShutdown(): void {
 
 // ==================== MAIN ====================
 
+// Допустимые значения EXECUTION_MODE (settings.ts). Опечатка ловится здесь
+// понятным сообщением, а не типом в пользовательском файле.
+const VALID_EXECUTION_MODES = ['limit', 'leader-follower', 'market'];
+
 async function main(): Promise<void> {
   printBanner();
+
+  if (!VALID_EXECUTION_MODES.includes(EXECUTION_MODE)) {
+    console.log(
+      `\n❌ Неизвестный EXECUTION_MODE "${EXECUTION_MODE}" в settings.ts. ` +
+      `Допустимые значения: 'limit', 'leader-follower', 'market'.`
+    );
+    process.exit(1);
+  }
+
   setupShutdown();
 
   // Step 1: Mode selector (before any connection)

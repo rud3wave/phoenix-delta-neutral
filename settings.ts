@@ -48,9 +48,9 @@ export const TOKENS_TO_TRADE = ['ETH'];
 //
 // Каждый токен должен быть в списке! Максимумы биржи: ETH 25x | SOL 25x | BTC 40x.
 export const LEVERAGE = {
-  ETH: [7, 10],
+  ETH: [9, 10],
   // SOL: [7, 10],
-  // BTC: [7, 10],
+  // BTC: [31, 38],
 };
 
 // --- ГРУППЫ ---

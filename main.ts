@@ -176,7 +176,10 @@ async function runDeltaNeutral(services: PhoenixService[]): Promise<void> {
 // ==================== MODE 2: CLOSE ALL ====================
 
 async function closeAllPositions(services: PhoenixService[]): Promise<void> {
-  console.log('\n🔄 Closing all positions (leader LIMIT → follower MARKET)...');
+  // Расширяем литерал settings.ts до string — как в close-strategy.ts
+  const mode: string = EXECUTION_MODE;
+  const closeStyle = mode === 'market' ? 'all via MARKET' : 'both sides maker LIMIT';
+  console.log(`\n🔄 Closing all positions (${closeStyle})...`);
 
   // Cancel configured-symbol orders on every wallet, including wallets that do
   // not currently have a position but may still have a resting entry order.
@@ -459,6 +462,7 @@ let controllerDone: Promise<void> | null = null;
 
 function setupShutdown(): void {
   const shutdown = async () => {
+    console.log('\n🛑 Stopped by user (Ctrl+C)');
     requestTradingHalt();
     controllerRef?.stop();
     if (controllerDone) {

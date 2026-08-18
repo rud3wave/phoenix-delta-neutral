@@ -448,7 +448,9 @@ export class PhoenixApiClient {
       headers: baseHeaders,
       proxyUrl: opts.proxyUrl,
       useHeaderGenerator: false,
-      timeout: { request: 60_000 },
+      // 30с: мёртвый прокси должен быстро отваливаться в ошибку/ротацию,
+      // а не выглядеть как «зависание» (ранее 60с молчания)
+      timeout: { request: 30_000 },
       retry: { limit: 1 },
     });
   }

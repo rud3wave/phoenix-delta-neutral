@@ -317,9 +317,13 @@ export class DeltaNeutralController {
     } catch (e: any) {
       console.log(`\n  ❌ Strategy failed: ${shortError(e)}`);
       if (group.opened) {
-        console.log('  🚨 Closing positions: leader LIMIT → follower MARKET...');
+        const mode: string = EXECUTION_MODE;
+        console.log(
+          `  🚨 Closing positions: ${mode === 'market' ? 'all via MARKET' : 'both sides maker LIMIT'}...`
+        );
         try {
-          // Та же схема, что и штатное закрытие: лидер — лимитки, вторая сторона — маркет
+          // Та же схема, что и штатное закрытие: обе стороны maker LIMIT,
+          // при односторонности отстающая — MARKET
           const biggest = [...accounts].sort((a, b) => (b.orderAmount ?? 0) - (a.orderAmount ?? 0))[0];
           const limitSide = biggest?.side ?? 'long';
           const marketSide = limitSide === 'long' ? 'short' : 'long';
@@ -656,7 +660,9 @@ export class DeltaNeutralController {
       tracks.push({
         acc,
         preUnits,
-        targetUnits: (acc.orderAmount ?? 0) / midPrice,
+        // Цель в целых лотах: иначе «хвост» меньше лота зависал бы как
+        // «незаполненный» (re-place: quantity rounds to zero lots)
+        targetUnits: await acc.service.quantizeBaseUnits(srcToken, (acc.orderAmount ?? 0) / midPrice),
         filledUnits: 0,
       });
     }

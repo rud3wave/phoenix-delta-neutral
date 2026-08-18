@@ -73,18 +73,28 @@ export async function openBothSidesLimit(
     } catch {
       // позиция неизвестна — считаем с нуля, первый полл поправит
     }
+    // Цель выравнивается до целых лотов СРАЗУ: on-chain программа отклоняет
+    // дробные лоты, и «хвост» меньше лота навсегда зависал бы как
+    // «незаполненный» ордер (re-place: quantity rounds to zero lots).
+    const targetUnits = await acc.service.quantizeBaseUnits(symbol, acc.orderAmount / midPrice);
     tracks.push({
       acc,
       preUnits,
-      targetUnits: acc.orderAmount / midPrice,
+      targetUnits,
       filledUnits: 0,
       price: 0,
       lastPlaceAttempt: 0,
     });
   }
 
-  const longSide = tracks.filter((t) => t.acc.side === 'long');
-  const shortSide = tracks.filter((t) => t.acc.side === 'short');
+  const tradable = tracks.filter((t) => t.targetUnits > 0);
+  if (tradable.length === 0) {
+    console.log(`  ℹ️ All allocations below one ${symbol} lot — nothing to open`);
+    return;
+  }
+
+  const longSide = tradable.filter((t) => t.acc.side === 'long');
+  const shortSide = tradable.filter((t) => t.acc.side === 'short');
   const nakedTimeoutMs = ONE_SIDED_OPEN_TIMEOUT_SEC > 0
     ? ONE_SIDED_OPEN_TIMEOUT_SEC * 1000
     : Number.POSITIVE_INFINITY;
@@ -96,7 +106,7 @@ export async function openBothSidesLimit(
 
   if (isTradingHalted()) throw new Error('Trading halted by Force Close');
 
-  const pending = new Set(tracks);
+  const pending = new Set(tradable);
   const oneSided = { since: null as number | null };
   let markedOpened = false;
   const notifyOpened = (): void => {
@@ -134,7 +144,7 @@ export async function openBothSidesLimit(
       for (const t of laggards) pending.delete(t);
       oneSided.since = null;
       if (failed.length > 0) {
-        await cancelAll(tracks.map((t) => t.acc), symbol);
+        await cancelAll(tradable.map((t) => t.acc), symbol);
         throw new Error(
           `${failed.length} laggard(s) failed to open via MARKET — group left one-sided`
         );
@@ -148,7 +158,7 @@ export async function openBothSidesLimit(
     await rePlace([...pending], symbol, notifyOpened);
   }
 
-  await cancelAll(tracks.map((t) => t.acc), symbol);
+  await cancelAll(tradable.map((t) => t.acc), symbol);
   console.log(`  ✅ ${symbol} opened (both sides maker LIMIT)`);
 }
 

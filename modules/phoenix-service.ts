@@ -35,6 +35,7 @@ import {
   type Instruction,
 } from '@solana/kit';
 import {
+  ComputeBudgetProgram,
   Connection,
   Keypair,
   PublicKey,
@@ -78,6 +79,18 @@ const REFERRAL_SENDER_PUBKEYS = [
 // quote lots -> USDC (USDC has 6 decimals, quote lots are micro-USDC)
 const USDC_QUOTE_LOT_MULTIPLIER = 1e6;
 
+// CU-бюджет транзакций. «Холодный» трейдер (вытеснен из active-буфера за
+// неактивность) при первом ордере активируется прямо внутри инструкции —
+// активация съедает ~200k CU, и дефолтного лимита 200k не хватает даже на
+// сам ордер (exceeded CUs meter → ProgramFailedToComplete). Запас покрывает
+// активацию + ордер/канцел с глубоким стаканом.
+const COMPUTE_UNIT_LIMIT = 600_000;
+
+/** ComputeBudget-инструкция: расширенный CU-лимит первой инструкцией. */
+function computeBudgetIx(): TransactionInstruction {
+  return ComputeBudgetProgram.setComputeUnitLimit({ units: COMPUTE_UNIT_LIMIT });
+}
+
 // ==================== PROXY-AWARE FETCH FOR RPC ====================
 
 function createProxyFetch(proxyUrl?: string): typeof fetch {
@@ -113,7 +126,9 @@ function createProxyFetch(proxyUrl?: string): typeof fetch {
       body: bodyStr,
       proxyUrl,
       useHeaderGenerator: false,
-      timeout: { request: 60_000 },
+      // 30с: мёртвый прокси/узел должен быстро отваливаться в фолбэк/ретрай,
+      // а не выглядеть как «зависание» (ранее 60с молчания на каждый хоп)
+      timeout: { request: 30_000 },
       responseType: 'text',
     });
 
@@ -681,7 +696,7 @@ export class PhoenixService {
           const messageV0 = new TransactionMessage({
             payerKey: this.wallet.publicKey,
             recentBlockhash: blockhash,
-            instructions: ixs,
+            instructions: [computeBudgetIx(), ...ixs],
           }).compileToV0Message();
 
           const transaction = new VersionedTransaction(messageV0);
@@ -1117,7 +1132,7 @@ export class PhoenixService {
     const messageV0 = new TransactionMessage({
       payerKey: this.wallet.publicKey,
       recentBlockhash: blockhash,
-      instructions: ixs,
+      instructions: [computeBudgetIx(), ...ixs],
     }).compileToV0Message();
 
     const transaction = new VersionedTransaction(messageV0);
@@ -1452,7 +1467,7 @@ export class PhoenixService {
       const messageV0 = new TransactionMessage({
         payerKey: this.wallet.publicKey,
         recentBlockhash: blockhash,
-        instructions: ixs,
+        instructions: [computeBudgetIx(), ...ixs],
       }).compileToV0Message();
 
       const transaction = new VersionedTransaction(messageV0);
@@ -1565,7 +1580,7 @@ export class PhoenixService {
         const messageV0 = new TransactionMessage({
           payerKey: this.wallet.publicKey,
           recentBlockhash: blockhash,
-          instructions: ixs,
+          instructions: [computeBudgetIx(), ...ixs],
         }).compileToV0Message();
         const transaction = new VersionedTransaction(messageV0);
         transaction.sign([this.wallet]);
@@ -1608,11 +1623,33 @@ export class PhoenixService {
         .getSignatureStatuses([signature], { searchTransactionHistory: true })
         .catch(() => null);
       const status = statuses?.value?.[0];
-      if (status?.err) throw new Error(`Transaction failed: ${JSON.stringify(status.err)}`);
+      if (status?.err) {
+        const logs = await this.fetchFailureLogs(signature);
+        throw new Error(
+          `Transaction failed: ${JSON.stringify(status.err)}${logs ? ` | ${logs}` : ''}`
+        );
+      }
       if (status?.confirmationStatus === commitment || status?.confirmationStatus === 'finalized') return;
       await sleep(pollInterval / 1000);
     }
 
     throw new Error(`Transaction confirmation timeout after ${timeout}ms`);
+  }
+
+  /** Program-логи упавшей транзакции: настоящая причина ончейн-отказа.
+  * Формат «Program log: …» подхватывает shortError. */
+  private async fetchFailureLogs(signature: string): Promise<string | null> {
+    try {
+      const tx = await this.connection.getTransaction(signature, {
+        commitment: 'confirmed',
+        maxSupportedTransactionVersion: 0,
+      });
+      const lines = (tx?.meta?.logMessages ?? [])
+        .filter((l) => l.startsWith('Program log:') && !/invoke|success|Instruction:/i.test(l))
+        .map((l) => l.replace(/^Program log:\s*/, ''));
+      return lines.length > 0 ? `Program log: ${lines.join(' | ')}` : null;
+    } catch {
+      return null;
+    }
   }
 }

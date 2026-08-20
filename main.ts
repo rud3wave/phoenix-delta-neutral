@@ -227,7 +227,21 @@ async function closeAllPositions(services: PhoenixService[]): Promise<void> {
   }
 
   // Step 3: Report per-wallet PnL
+  const allPositions = snapshot.flatMap((s) => s.positions);
+  const longVol = allPositions.filter((p) => p.side === 'long').reduce((sum, p) => sum + p.positionUsd, 0);
+  const shortVol = allPositions.filter((p) => p.side === 'short').reduce((sum, p) => sum + p.positionUsd, 0);
+  const maxSideVol = Math.max(longVol, shortVol);
+  const deltaPct = maxSideVol > 0 ? (Math.abs(longVol - shortVol) / maxSideVol) * 100 : 0;
+
   const lines: string[] = ['📂 POSITIONS CLOSED | Force close', ''];
+  lines.push(`🟢 LONG: $${longVol.toFixed(2)} | 🔴 SHORT: $${shortVol.toFixed(2)} | Δ: ${deltaPct.toFixed(2)}%`);
+  if (deltaPct > 2) {
+    lines.push(
+      `⚠️ Книга закрыта с перекосом дельты ${deltaPct.toFixed(1)}% ` +
+      `(${longVol > shortVol ? 'net LONG' : 'net SHORT'} $${Math.abs(longVol - shortVol).toFixed(0)})`
+    );
+  }
+  lines.push('');
   let totalPnl = 0;
   let totalVolume = 0;
   let totalFees = 0;

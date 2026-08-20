@@ -38,6 +38,8 @@ interface OpenTrack {
 
 const FILL_EPS = 0.001;
 const PRICE_EPS = 1e-9;
+/** Насколько позиция может превысить цель, прежде чем это станет предупреждением. */
+const OVERSHOOT_EPS = 0.02;
 
 /** Как часто повторять постановку, если открывающая лимитка не встала после ошибки. */
 const MISSING_ORDER_RETRY_SEC = 15;
@@ -175,6 +177,15 @@ async function rePlace(
   await Promise.all(tracks.map(async (t) => {
     try {
       await t.acc.service.cancelAllOrders(symbol);
+      // Свежий срез позиции: filledUnits взят из последнего полла и мог устареть —
+      // ордер мог исполниться ровно в момент отмены (на движении цены). Ставить
+      // замену по старому остатку = открыть тот же объём второй раз сверх цели.
+      try {
+        const currentUnits = await t.acc.service.getPositionBaseUnits(symbol);
+        t.filledUnits = Math.max(t.filledUnits, Math.max(0, currentUnits - t.preUnits));
+      } catch {
+        // RPC сбой — остаёмся на последнем известном filledUnits
+      }
       // Достаём только недостающее: лимитка могла заполниться частично
       const remainingUnits = Math.max(0, t.targetUnits - t.filledUnits);
       if (remainingUnits <= 1e-9) return;
@@ -265,6 +276,13 @@ async function pollRound(
     for (const { t, delta } of results) {
       t.filledUnits = delta;
       if (delta >= t.targetUnits * (1 - FILL_EPS)) {
+        if (delta > t.targetUnits * (1 + OVERSHOOT_EPS)) {
+          console.log(
+            `  ⚠️ ${shortAddr(t.acc.service.getAddress())} overshoot: opened ` +
+            `${parseFloat(delta.toFixed(6))} ${symbol} vs plan ` +
+            `${parseFloat(t.targetUnits.toFixed(6))} — fill race at re-quote`
+          );
+        }
         onFilled(t);
         pending.delete(t);
       }

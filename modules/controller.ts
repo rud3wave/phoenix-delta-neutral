@@ -475,11 +475,18 @@ export class DeltaNeutralController {
       }
       lines.push('');
 
+      // Фактические (не плановые) notional по сторонам — по ним видно реальную дельту
+      let longActual = 0;
+      let shortActual = 0;
       for (const acc of accounts) {
         try {
           const liq = await acc.service.getPositionWithLiquidation(srcToken);
           const emoji = acc.side === 'long' ? '🟢' : '🔴';
           const side = acc.side === 'long' ? 'LONG' : 'SHORT';
+          if (liq.hasPosition) {
+            if (liq.side === 'long') longActual += liq.positionUsd;
+            else shortActual += liq.positionUsd;
+          }
           lines.push(
             `${emoji} ${side} ${shortAddr(acc.address)} | $${liq.positionUsd.toFixed(2)} | ` +
             `Lev: ${liq.effectiveLeverage.toFixed(1)}x | ` +
@@ -491,10 +498,18 @@ export class DeltaNeutralController {
         }
       }
 
-      const longTotal = accounts.filter((a) => a.side === 'long').reduce((s, a) => s + (a.orderAmount ?? 0), 0);
-      const shortTotal = accounts.filter((a) => a.side === 'short').reduce((s, a) => s + (a.orderAmount ?? 0), 0);
+      const maxSide = Math.max(longActual, shortActual);
+      const deltaAbs = longActual - shortActual;
+      const deltaPct = maxSide > 0 ? (Math.abs(deltaAbs) / maxSide) * 100 : 0;
       lines.push('');
-      lines.push(`🟢 LONG: $${longTotal.toFixed(2)} | 🔴 SHORT: $${shortTotal.toFixed(2)}`);
+      lines.push(`🟢 LONG: $${longActual.toFixed(2)} | 🔴 SHORT: $${shortActual.toFixed(2)} | Δ: ${deltaPct.toFixed(2)}%`);
+      if (deltaPct > 2) {
+        const warn =
+          `⚠️ DELTA IMBALANCE ${deltaPct.toFixed(1)}% — ` +
+          `${deltaAbs > 0 ? 'net LONG' : 'net SHORT'} $${Math.abs(deltaAbs).toFixed(0)}. Книга не хеджирована!`;
+        console.log(`  ${warn}`);
+        lines.push(warn);
+      }
 
       await sendTg(lines.join('\n'));
     }

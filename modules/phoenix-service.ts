@@ -739,8 +739,10 @@ export class PhoenixService {
     await this.getBaseLotsDecimals(symbol);
     const baseUnits = this.lotsToBaseUnits(Math.abs(Number(position.basePositionLots)), symbol);
     const closeSide = Number(position.basePositionLots) > 0 ? 'short' : 'long';
+    // В логе — сторона ПОЗИЦИИ, а не закрывающего ордера (он противоположен)
+    const positionSide = Number(position.basePositionLots) > 0 ? 'LONG' : 'SHORT';
 
-    console.log(`  📋 ${shortAddr(this.walletAddress)} | Closing ${symbol} via LIMIT | ${closeSide.toUpperCase()} | ${parseFloat(baseUnits.toFixed(6))} ${symbol}`);
+    console.log(`  📋 ${shortAddr(this.walletAddress)} | Closing ${symbol} via LIMIT | ${positionSide} | ${parseFloat(baseUnits.toFixed(6))} ${symbol}`);
 
     const { orderPrice } = await this.placePositionOrder({
       instrument: symbol,
@@ -766,8 +768,10 @@ export class PhoenixService {
     await this.getBaseLotsDecimals(symbol);
     const baseUnits = this.lotsToBaseUnits(Math.abs(Number(position.basePositionLots)), symbol);
     const closeSide = Number(position.basePositionLots) > 0 ? 'short' : 'long';
+    // В логе — сторона ПОЗИЦИИ, а не закрывающего ордера (он противоположен)
+    const positionSide = Number(position.basePositionLots) > 0 ? 'LONG' : 'SHORT';
 
-    console.log(`  🚀 ${shortAddr(this.walletAddress)} | Closing ${symbol} via MARKET | ${closeSide.toUpperCase()} | ${parseFloat(baseUnits.toFixed(6))} ${symbol}`);
+    console.log(`  🚀 ${shortAddr(this.walletAddress)} | Closing ${symbol} via MARKET | ${positionSide} | ${parseFloat(baseUnits.toFixed(6))} ${symbol}`);
 
     await this.placePositionOrder({
       instrument: symbol,

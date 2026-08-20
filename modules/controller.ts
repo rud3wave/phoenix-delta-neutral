@@ -3,7 +3,7 @@
 // ============================================================
 // Open (по EXECUTION_MODE):
 //   limit           — обе стороны ставят LIMIT одновременно (maker),
-//                     при односторонности отстающая — MARKET (open-strategy.ts)
+//                     без маркет-доедания: ждём филла обеих (open-strategy.ts)
 //   leader-follower — leader LIMIT (maker) → poll fills (re-place after 2min)
 //                     → follower MARKET (taker) with the exact leader lots
 //   market          — всё MARKET сразу
@@ -20,7 +20,6 @@ import {
   TRADES_COUNT,
   DELAY_BETWEEN_TRADES,
   POLL_INTERVAL_SEC,
-  TOKENS_TO_TRADE,
   RETRY,
   EXECUTION_MODE,
   FILL_POLL_INTERVAL_MS,
@@ -171,7 +170,8 @@ export class DeltaNeutralController {
         }
 
         // Токен выбираем ДО группы: стороны кошельков фиксируются по открытым позициям
-        const srcToken = TOKENS_TO_TRADE[Math.floor(Math.random() * TOKENS_TO_TRADE.length)]!;
+        const tokens = Object.keys(LEVERAGE);
+        const srcToken = tokens[Math.floor(Math.random() * tokens.length)]!;
 
         // Refresh balances + existing positions for the whole pool
         console.log(`\n  🔄 Refreshing balances & ${srcToken} positions...`);
@@ -676,7 +676,7 @@ export class DeltaNeutralController {
           await acc.service.placePositionOrder({
             instrument: srcToken,
             executionSide: limitSide,
-            executionType: 'limit',
+            executionType: 'post-only',
             amountUsd: acc.orderAmount!,
           });
         } catch (e: any) {
@@ -739,7 +739,7 @@ export class DeltaNeutralController {
           await t.acc.service.placePositionOrder({
             instrument: srcToken,
             executionSide: limitSide,
-            executionType: 'limit',
+            executionType: 'post-only',
             amountUsd: t.acc.orderAmount!,
             overrideBaseUnits: remainingUnits,
           });

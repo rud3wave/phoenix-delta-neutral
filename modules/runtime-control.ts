@@ -1,6 +1,7 @@
 import {
   existsSync,
   readFileSync,
+  statSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
@@ -58,8 +59,12 @@ export function releaseTradingLock(): void {
   }
 }
 
+/** Когда ЭТОТ процесс запросил halt (0 = не запрашивал). */
+let haltRequestedAtMs = 0;
+
 export function requestTradingHalt(): void {
-  writeFileSync(HALT_PATH, `${Date.now()}\n`, 'utf8');
+  haltRequestedAtMs = Date.now();
+  writeFileSync(HALT_PATH, `${haltRequestedAtMs}\n`, 'utf8');
 }
 
 export function clearTradingHalt(): void {
@@ -68,4 +73,19 @@ export function clearTradingHalt(): void {
 
 export function isTradingHalted(): boolean {
   return existsSync(HALT_PATH);
+}
+
+/** Halt активен, только если он запрошен ПОСЛЕ `sinceMs` (этим процессом
+ * или другим — по mtime файла). Режим 2 сам ставит halt при старте, чтобы
+ * остановить торгующий процесс; собственный цикл закрытия не должен из-за
+ * этого останавливаться — он реагирует лишь на halt, возникший позже
+ * (Ctrl+C или Force Close, запущенный во время закрытия). */
+export function isTradingHaltedSince(sinceMs: number): boolean {
+  if (!existsSync(HALT_PATH)) return false;
+  if (haltRequestedAtMs > sinceMs) return true;
+  try {
+    return statSync(HALT_PATH).mtimeMs > sinceMs;
+  } catch {
+    return false;
+  }
 }

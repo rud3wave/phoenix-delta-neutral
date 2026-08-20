@@ -11,7 +11,7 @@
 
 import { createInterface } from 'node:readline';
 
-import { EXECUTION_MODE, ID_FILTER, SHUFFLE_WALLETS, TOKENS_TO_TRADE } from './settings.js';
+import { EXECUTION_MODE, ID_FILTER, LEVERAGE, SHUFFLE_WALLETS } from './settings.js';
 import { DeltaNeutralController } from './modules/controller.js';
 import { closeLeaderFollower } from './modules/close-strategy.js';
 import { PhoenixService } from './modules/phoenix-service.js';
@@ -35,6 +35,8 @@ import {
   requestTradingHalt,
 } from './modules/runtime-control.js';
 
+const TOKENS_TO_TRADE = Object.keys(LEVERAGE);
+
 // ==================== BANNER ====================
 
 function printBanner(): void {
@@ -54,7 +56,7 @@ function askMode(): Promise<string> {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   return new Promise((resolve) => {
     rl.question(
-      `\nВыбери режим:\n  1 = Дельта-нейтральная торговля\n  2 = Закрыть все позиции\n  3 = Проверить балансы\n  4 = Клеймить награды\n  5 = Пополнить биржу с кошелька\n  6 = Вывод средств\n\n> `,
+      `\nВыбери режим:\n  1 = Дельта-нейтральная торговля\n  2 = Закрыть все позиции\n  3 = Проверить балансы\n  4 = Клеймить награды\n  5 = Пополнить биржу с кошелька\n  6 = Вывод средств\n  7 = Снять все ордера\n\n> `,
       (answer) => {
         rl.close();
         resolve(answer.trim());
@@ -169,8 +171,6 @@ async function runDeltaNeutral(services: PhoenixService[]): Promise<void> {
     controllerRef = null;
     releaseTradingLock();
   }
-
-  await sendTg('BOT STOPPED | Delta-neutral mode finished');
 }
 
 // ==================== MODE 2: CLOSE ALL ====================
@@ -459,21 +459,54 @@ async function withdrawUsdc(services: PhoenixService[]): Promise<void> {
 
 let controllerRef: DeltaNeutralController | null = null;
 let controllerDone: Promise<void> | null = null;
+let servicesRef: PhoenixService[] = [];
+let shuttingDown = false;
 
 function setupShutdown(): void {
   const shutdown = async () => {
+    if (shuttingDown) {
+      console.log('\n⏳ Already stopping — cleaning up orders...');
+      return;
+    }
+    shuttingDown = true;
     console.log('\n🛑 Stopped by user (Ctrl+C)');
     requestTradingHalt();
     controllerRef?.stop();
-    if (controllerDone) {
-      await Promise.race([controllerDone, sleep(30)]);
+    try {
+      if (controllerDone) {
+        // in-flight цикл видит halt и сам снимает свои ордера
+        await Promise.race([controllerDone, sleep(2000)]);
+      } else {
+        // режим 2: in-flight close-цикл видит halt и сам снимает лимитки
+        await sleep(1500);
+      }
+      await Promise.race([cancelAllRestingOrders(), sleep(10_000)]);
+    } catch {
+      // cleanup best-effort — выходим в любом случае
     }
     releaseTradingLock();
     process.exit(0);
   };
 
-  process.once('SIGINT', shutdown);
-  process.once('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+}
+
+/** Best-effort снять все висящие ордера на всех кошельках. */
+async function cancelAllRestingOrders(): Promise<void> {
+  if (servicesRef.length === 0) return;
+  console.log('🧹 Cancelling resting orders...');
+  const results = await Promise.allSettled(
+    servicesRef.flatMap((service) =>
+      TOKENS_TO_TRADE.map((symbol) => service.cancelAllOrders(symbol))
+    )
+  );
+  const failed = results.filter((r) => r.status === 'rejected').length;
+  console.log(
+    failed === 0
+      ? '✅ Resting orders cancelled'
+      : `⚠️ Order cancel finished with ${failed} error(s)`
+  );
 }
 
 // ==================== MAIN ====================
@@ -489,6 +522,13 @@ async function main(): Promise<void> {
     console.log(
       `\n❌ Неизвестный EXECUTION_MODE "${EXECUTION_MODE}" в settings.ts. ` +
       `Допустимые значения: 'limit', 'leader-follower', 'market'.`
+    );
+    process.exit(1);
+  }
+
+  if (TOKENS_TO_TRADE.length === 0) {
+    console.log(
+      `\n❌ В LEVERAGE (settings.ts) нет ни одного раскоментированного токена — боту нечем торговать.`
     );
     process.exit(1);
   }
@@ -537,6 +577,7 @@ async function main(): Promise<void> {
   }
 
   console.log(`\n✅ ${services.length}/${wallets.length} wallet(s) connected`);
+  servicesRef = services;
 
   // Step 4: Execute selected mode
   try {
@@ -560,8 +601,11 @@ async function main(): Promise<void> {
       case '6':
         await withdrawUsdc(services);
         break;
+      case '7':
+        await cancelAllRestingOrders();
+        break;
       default:
-        console.log(`\n❌ Неизвестный режим: "${mode}". Выбери 1, 2, 3, 4, 5 или 6.`);
+        console.log(`\n❌ Неизвестный режим: "${mode}". Выбери 1, 2, 3, 4, 5, 6 или 7.`);
         process.exit(1);
     }
   } catch (e: any) {

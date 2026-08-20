@@ -21,6 +21,7 @@ import {
   TOP_OF_BOOK_CHECK_SEC,
 } from '../settings.js';
 import { PhoenixService } from './phoenix-service.js';
+import { isTradingHaltedSince } from './runtime-control.js';
 import { sleep, shortAddr, shortError } from './utils.js';
 
 // Режим из settings.ts, расширенный до string: от опечаток страхует
@@ -60,8 +61,10 @@ async function closeByMarketWithRetry(acc: CloseAccount, symbol: string, attempt
 async function placeLimits(
   accounts: Iterable<CloseAccount>,
   symbol: string,
-  orderInfo: Map<CloseAccount, OrderInfo>
+  orderInfo: Map<CloseAccount, OrderInfo>,
+  halted: () => boolean
 ): Promise<void> {
+  if (halted()) return;
   await Promise.all([...accounts].map(async (acc) => {
     try {
       const placed = await acc.service.closePositionByLimit(symbol);
@@ -75,8 +78,10 @@ async function placeLimits(
 async function rePlace(
   accounts: Iterable<CloseAccount>,
   symbol: string,
-  orderInfo: Map<CloseAccount, OrderInfo>
+  orderInfo: Map<CloseAccount, OrderInfo>,
+  halted: () => boolean
 ): Promise<void> {
+  if (halted()) return;
   await Promise.all([...accounts].map(async (acc) => {
     try {
       await acc.service.cancelAllOrders(symbol);
@@ -96,7 +101,8 @@ async function maintainTopOfBook(
   pending: Set<CloseAccount>,
   symbol: string,
   orderInfo: Map<CloseAccount, OrderInfo>,
-  placeRetry: Map<CloseAccount, number>
+  placeRetry: Map<CloseAccount, number>,
+  halted: () => boolean
 ): Promise<void> {
   if (pending.size === 0) return;
 
@@ -126,7 +132,7 @@ async function maintainTopOfBook(
 
   for (const acc of behind) placeRetry.set(acc, now);
   console.log(`  ⬆️ ${behind.length} limit(s) missing or off the top of the book — re-placing at best...`);
-  await rePlace(behind, symbol, orderInfo);
+  await rePlace(behind, symbol, orderInfo, halted);
 }
 
 async function cancelAll(accounts: CloseAccount[], symbol: string): Promise<void> {
@@ -155,7 +161,8 @@ async function pollRound(
   deadline: number,
   onFilled: (acc: CloseAccount) => void,
   orderInfo: Map<CloseAccount, OrderInfo>,
-  placeRetry: Map<CloseAccount, number>
+  placeRetry: Map<CloseAccount, number>,
+  halted: () => boolean
 ): Promise<void> {
   const pollSec = FILL_POLL_INTERVAL_MS / 1000;
   const roundStart = Date.now();
@@ -163,6 +170,7 @@ async function pollRound(
   let lastTopCheckAt = 0;
 
   while (pending.size > 0 && Date.now() < deadline) {
+    if (halted()) return;
     await sleep(pollSec);
 
     const results = await Promise.all([...pending].map(async (acc) => {
@@ -183,7 +191,7 @@ async function pollRound(
     const now = Date.now();
     if (pending.size > 0 && now - lastTopCheckAt >= TOP_OF_BOOK_CHECK_SEC * 1000) {
       lastTopCheckAt = now;
-      await maintainTopOfBook(pending, symbol, orderInfo, placeRetry);
+      await maintainTopOfBook(pending, symbol, orderInfo, placeRetry, halted);
     }
 
     if (pending.size > 0 && now - lastLogAt >= 15_000) {
@@ -229,16 +237,27 @@ export async function closeLeaderFollower(
     ? ONE_SIDED_CLOSE_TIMEOUT_SEC * 1000
     : Number.POSITIVE_INFINITY;
 
+  // Режим 2 сам ставит halt-файл при старте (чтобы остановить торгующий
+  // процесс), поэтому свой же halt закрытие игнорирует — отменяет только
+  // halt, запрошенный позже начала закрытия (Ctrl+C / чужой Force Close).
+  const closeStartedAt = Date.now();
+  const halted = (): boolean => isTradingHaltedSince(closeStartedAt);
+
   // ========== One-sided residuals: maker LIMIT, timed market fallback ==========
   if (limitAccounts.length === 0 || marketAccounts.length === 0) {
     console.log(`\n  📋 Closing ${all.length} ${symbol} residual via LIMIT (maker)...`);
     const pendingClose = new Set(all);
     const orderInfo = new Map<CloseAccount, OrderInfo>();
     const placeRetry = new Map<CloseAccount, number>();
-    await placeLimits(pendingClose, symbol, orderInfo);
+    await placeLimits(pendingClose, symbol, orderInfo, halted);
 
     let closeRetryCount = 0;
     while (pendingClose.size > 0) {
+      if (halted()) {
+        console.log('  🛑 Halt received — cancelling resting close limits...');
+        await cancelAll(all, symbol);
+        return;
+      }
       closeRetryCount++;
       const roundDeadline = Math.min(
         Date.now() + REQUOTE_INTERVAL_SEC * 1000,
@@ -246,7 +265,7 @@ export async function closeLeaderFollower(
       );
       await pollRound(pendingClose, symbol, roundDeadline, (acc) => {
         console.log(`  ✅ ${shortAddr(acc.service.getAddress())} closed via LIMIT (maker)`);
-      }, orderInfo, placeRetry);
+      }, orderInfo, placeRetry, halted);
 
       if (pendingClose.size === 0) break;
 
@@ -257,7 +276,7 @@ export async function closeLeaderFollower(
       }
 
       console.log(`  🔄 ${pendingClose.size} limit(s) unfilled — cancelling & re-placing (attempt ${closeRetryCount})...`);
-      await rePlace(pendingClose, symbol, orderInfo);
+      await rePlace(pendingClose, symbol, orderInfo, halted);
     }
 
     await cancelAll(all, symbol);
@@ -273,19 +292,24 @@ export async function closeLeaderFollower(
   const pending = new Set(all);
   const orderInfo = new Map<CloseAccount, OrderInfo>();
   const placeRetry = new Map<CloseAccount, number>();
-  await placeLimits(pending, symbol, orderInfo);
+  await placeLimits(pending, symbol, orderInfo, halted);
 
   let closeRetryCount = 0;
   let oneSidedSince: number | null = null;
 
   while (pending.size > 0) {
+    if (halted()) {
+      console.log('  🛑 Halt received — cancelling resting close limits...');
+      await cancelAll(all, symbol);
+      return;
+    }
     closeRetryCount++;
     const roundStart = Date.now();
     const roundDeadline = roundStart + REQUOTE_INTERVAL_SEC * 1000;
 
     await pollRound(pending, symbol, roundDeadline, (acc) => {
       console.log(`  ✅ ${shortAddr(acc.service.getAddress())} closed via LIMIT (maker)`);
-    }, orderInfo, placeRetry);
+    }, orderInfo, placeRetry, halted);
 
     if (pending.size === 0) break;
 
@@ -312,7 +336,7 @@ export async function closeLeaderFollower(
     }
 
     console.log(`  🔄 ${pending.size} limit(s) unfilled — cancelling & re-placing (attempt ${closeRetryCount})...`);
-    await rePlace(pending, symbol, orderInfo);
+    await rePlace(pending, symbol, orderInfo, halted);
   }
 
   await cancelAll(all, symbol);

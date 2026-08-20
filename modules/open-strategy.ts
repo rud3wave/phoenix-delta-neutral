@@ -1,22 +1,18 @@
 // ============================================================
 //  OPEN STRATEGY — both sides open via LIMIT simultaneously
 // ============================================================
-// Зеркало close-strategy для входа: обе стороны одновременно ставят
-// открывающие лимитки на тач (мейкер) и переставляют незаполненные
-// каждые REQUOTE_INTERVAL_SEC. Между перестановками лимитки держатся
-// первыми в стакане: каждые TOP_OF_BOOK_CHECK_SEC проверяем верх стакана
-// и, если цена ушла, ордер сразу переставляется на лучший бид/аск.
-// Если одна сторона заполнилась полностью, а вторая отстаёт дольше
-// ONE_SIDED_OPEN_TIMEOUT_SEC — отстающая открывается маркетом,
-// чтобы не упустить вход. Односторонность детектится прямо в цикле
-// опроса (каждые FILL_POLL_INTERVAL_MS), а не между перестановками.
+// Обе стороны одновременно ставят открывающие лимитки на тач (мейкер)
+// и переставляют незаполненные каждые REQUOTE_INTERVAL_SEC. Между
+// перестановками лимитки держатся первыми в стакане: каждые
+// TOP_OF_BOOK_CHECK_SEC проверяем верх стакана и, если цена ушла,
+// ордер сразу переставляется на лучший бид/аск. Маркет-доедания на
+// открытии НЕТ (регламент): ждём филла обеих лимиток — пока обе не
+// заполнились, портфель плоский.
 // ============================================================
 
 import {
   FILL_POLL_INTERVAL_MS,
-  ONE_SIDED_OPEN_TIMEOUT_SEC,
   REQUOTE_INTERVAL_SEC,
-  SLIPPAGE,
   TOP_OF_BOOK_CHECK_SEC,
 } from '../settings.js';
 import { PhoenixService } from './phoenix-service.js';
@@ -95,9 +91,6 @@ export async function openBothSidesLimit(
 
   const longSide = tradable.filter((t) => t.acc.side === 'long');
   const shortSide = tradable.filter((t) => t.acc.side === 'short');
-  const nakedTimeoutMs = ONE_SIDED_OPEN_TIMEOUT_SEC > 0
-    ? ONE_SIDED_OPEN_TIMEOUT_SEC * 1000
-    : Number.POSITIVE_INFINITY;
 
   console.log(
     `\n  📋 Opening BOTH sides via LIMIT (maker): ` +
@@ -107,7 +100,6 @@ export async function openBothSidesLimit(
   if (isTradingHalted()) throw new Error('Trading halted by Force Close');
 
   const pending = new Set(tradable);
-  const oneSided = { since: null as number | null };
   let markedOpened = false;
   const notifyOpened = (): void => {
     if (!markedOpened) {
@@ -120,37 +112,23 @@ export async function openBothSidesLimit(
 
   let openRetryCount = 0;
   while (pending.size > 0) {
+    if (isTradingHalted()) {
+      await cancelAll(tradable.map((t) => t.acc), symbol);
+      throw new Error('Trading halted by Force Close');
+    }
     openRetryCount++;
     const roundDeadline = Date.now() + REQUOTE_INTERVAL_SEC * 1000;
 
     const outcome = await pollRound(
-      pending, longSide, shortSide, symbol, roundDeadline,
+      pending, symbol, roundDeadline,
       (t) => {
         notifyOpened();
         console.log(`  ✅ ${shortAddr(t.acc.service.getAddress())} opened via LIMIT (maker)`);
       },
-      oneSided, nakedTimeoutMs, notifyOpened
+      notifyOpened
     );
 
     if (outcome === 'filled') break;
-
-    if (outcome === 'one-sided') {
-      const laggards = [...pending];
-      console.log(
-        `  🔄 One-sided for ${ONE_SIDED_OPEN_TIMEOUT_SEC}s — ` +
-        `MARKET opening ${laggards.length} laggard(s)...`
-      );
-      const failed = await marketOpenLaggards(laggards, symbol);
-      for (const t of laggards) pending.delete(t);
-      oneSided.since = null;
-      if (failed.length > 0) {
-        await cancelAll(tradable.map((t) => t.acc), symbol);
-        throw new Error(
-          `${failed.length} laggard(s) failed to open via MARKET — group left one-sided`
-        );
-      }
-      break;
-    }
 
     console.log(
       `  🔄 ${pending.size} limit(s) unfilled — cancelling & re-placing (attempt ${openRetryCount})...`
@@ -167,13 +145,14 @@ async function placeLimits(
   symbol: string,
   notifyOpened: () => void
 ): Promise<void> {
+  if (isTradingHalted()) return;
   let placed = false;
   await Promise.all(tracks.map(async (t) => {
     try {
       const res = await t.acc.service.placePositionOrder({
         instrument: symbol,
         executionSide: t.acc.side,
-        executionType: 'limit',
+        executionType: 'post-only',
         amountUsd: t.acc.orderAmount,
       });
       t.price = res.orderPrice ?? 0;
@@ -191,6 +170,7 @@ async function rePlace(
   symbol: string,
   notifyOpened: () => void
 ): Promise<void> {
+  if (isTradingHalted()) return;
   let placed = false;
   await Promise.all(tracks.map(async (t) => {
     try {
@@ -201,7 +181,7 @@ async function rePlace(
       const res = await t.acc.service.placePositionOrder({
         instrument: symbol,
         executionSide: t.acc.side,
-        executionType: 'limit',
+        executionType: 'post-only',
         amountUsd: t.acc.orderAmount,
         overrideBaseUnits: remainingUnits,
       });
@@ -256,21 +236,14 @@ async function maintainTopOfBook(
 }
 
 /** Один раунд быстрого опроса позиций (параллельно), строго до deadline.
- * Односторонность детектится прямо здесь: как только одна сторона открылась
- * полностью, а вторая ещё в ожидании — таймер стартует, и по истечении
- * ONE_SIDED_OPEN_TIMEOUT_SEC раунд прерывается для маркет-доедания.
  * Параллельно следит, чтобы лимитки оставались первыми в стакане. */
 async function pollRound(
   pending: Set<OpenTrack>,
-  longSide: OpenTrack[],
-  shortSide: OpenTrack[],
   symbol: string,
   deadline: number,
   onFilled: (t: OpenTrack) => void,
-  oneSided: { since: number | null },
-  nakedTimeoutMs: number,
   notifyOpened: () => void
-): Promise<'filled' | 'one-sided' | 'requote'> {
+): Promise<'filled' | 'requote'> {
   const pollSec = FILL_POLL_INTERVAL_MS / 1000;
   const roundStart = Date.now();
   let lastLogAt = 0;
@@ -299,17 +272,6 @@ async function pollRound(
 
     const now = Date.now();
 
-    // Односторонность: одна сторона открылась полностью, вторая ещё нет.
-    // Пока ожидаются обе (или ни одной) — таймер не идёт.
-    const longPending = longSide.some((t) => pending.has(t));
-    const shortPending = shortSide.some((t) => pending.has(t));
-    if (longPending !== shortPending) {
-      oneSided.since ??= now;
-      if (now - oneSided.since >= nakedTimeoutMs) return 'one-sided';
-    } else {
-      oneSided.since = null;
-    }
-
     if (pending.size > 0 && now - lastTopCheckAt >= TOP_OF_BOOK_CHECK_SEC * 1000) {
       lastTopCheckAt = now;
       await maintainTopOfBook(pending, symbol, notifyOpened);
@@ -325,85 +287,6 @@ async function pollRound(
   }
 
   return pending.size === 0 ? 'filled' : 'requote';
-}
-
-/** Маркет-открытие отстающей стороны с ретраями: транзитентная ошибка
- * не должна оставить группу односторонней без хеджа. */
-async function marketOpenLaggards(laggards: OpenTrack[], symbol: string): Promise<OpenTrack[]> {
-  const remaining = (t: OpenTrack): number => Math.max(0, t.targetUnits - t.filledUnits);
-  const totalRemaining = laggards.reduce((s, t) => s + remaining(t), 0);
-
-  if (totalRemaining > 1e-9) {
-    // Филлы наших лимиток оставили дыру в стакане: маркеты умрут об тонкий
-    // стакан. Ждём восстановления глубины в пределах слиппеджа.
-    await waitForBookRecovery(laggards[0]!.acc, symbol, laggards[0]!.acc.side, totalRemaining);
-  }
-
-  if (isTradingHalted()) throw new Error('Trading halted by Force Close');
-
-  const failed: OpenTrack[] = [];
-  await Promise.all(laggards.map(async (t) => {
-    try { await t.acc.service.cancelAllOrders(symbol); } catch { /* ok */ }
-    const units = remaining(t);
-    if (units <= 1e-9) return;
-    let lastError: any = null;
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      try {
-        await t.acc.service.placePositionOrder({
-          instrument: symbol,
-          executionSide: t.acc.side,
-          executionType: 'market',
-          amountUsd: t.acc.orderAmount,
-          overrideBaseUnits: units,
-        });
-        console.log(`  ✅ ${shortAddr(t.acc.service.getAddress())} opened via MARKET (fallback)`);
-        return;
-      } catch (e: any) {
-        lastError = e;
-        console.log(
-          `  ❌ MARKET open failed for ${shortAddr(t.acc.service.getAddress())} ` +
-          `(attempt ${attempt}/3): ${shortError(e)}`
-        );
-        if (attempt < 3) await sleep(1);
-      }
-    }
-    failed.push(t);
-  }));
-  return failed;
-}
-
-/** После филлов наших лимиток в стакане дыра на нашей стороне: маркеты
- * отстающих умирают об тонкий стакан. Ждём, пока глубина в пределах
- * слиппеджа восстановится до суммарного объёма (не дольше таймаута). */
-async function waitForBookRecovery(
-  reader: OpenAccount,
-  symbol: string,
-  marketSide: 'long' | 'short',
-  requiredUnits: number,
-  timeoutSec = 10
-): Promise<void> {
-  const deadline = Date.now() + timeoutSec * 1000;
-  const buy = marketSide === 'long';
-  let logged = false;
-
-  while (Date.now() < deadline) {
-    if (isTradingHalted()) throw new Error('Trading halted by Force Close');
-    try {
-      const depth = await reader.service.getBookDepth(symbol, buy ? 'buy' : 'sell', SLIPPAGE);
-      if (depth >= requiredUnits) return;
-      if (!logged) {
-        logged = true;
-        console.log(
-          `  ⏳ Book thin after limit fills ` +
-          `(${depth.toFixed(2)}/${requiredUnits.toFixed(2)} ${symbol} within slippage) — waiting for recovery...`
-        );
-      }
-    } catch {
-      return; // не удалось прочитать стакан — ретраи маркетов подстрахуют
-    }
-    await sleep(1);
-  }
-  console.log(`  ⚠️ Book still thin after ${timeoutSec}s — placing laggard markets anyway`);
 }
 
 async function cancelAll(accounts: OpenAccount[], symbol: string): Promise<void> {

@@ -745,7 +745,7 @@ export class PhoenixService {
     const { orderPrice } = await this.placePositionOrder({
       instrument: symbol,
       executionSide: closeSide as 'long' | 'short',
-      executionType: 'limit',
+      executionType: 'post-only',
       amountUsd: 0,
       overrideBaseUnits: baseUnits,
       reduceOnly: true,
@@ -864,6 +864,24 @@ export class PhoenixService {
       .reduce((sum, e) => sum + (parseFloat(e.fundingPayment) || 0), 0);
 
     return { fees: feesOpen + feesClose, feesOpen, feesClose, funding: fundingSum };
+  }
+
+  /** Сырая история филлов с биржи (аудит расходов: fees, maker/taker, tradeType). */
+  public async getTradeFills(symbol: string, limit = 200) {
+    const res = await this.apiClient.getTraderTradesHistory(
+      this.walletAddress,
+      { marketSymbol: symbol, limit }
+    );
+    return res.data;
+  }
+
+  /** Сырая история funding-платежей (аудит расходов). */
+  public async getFundingEvents(symbol: string, limit = 200) {
+    const res = await this.apiClient.getTraderFundingHistory(
+      this.walletAddress,
+      { symbol, limit }
+    );
+    return res.events;
   }
 
   public async waitForSpread(
@@ -1062,10 +1080,11 @@ export class PhoenixService {
         const bestAsk = orderbook.asks[0]?.[0] ?? midPrice;
         const market = client.exchange.market(marketSymbol as any);
         if (!market) throw new Error(`Missing market metadata for ${marketSymbol}`);
-        const limitPrice = Number((executionType === 'post-only'
-          ? (executionSide === 'long' ? bestAsk : bestBid)
-          : (executionSide === 'long' ? bestBid : bestAsk)
-        ).toFixed(10));
+        // Цена всегда на нашем таче: post-only со slide не пересечёт стакан,
+        // а orderPrice остаётся честным для top-of-book проверок.
+        const limitPrice = Number(
+          (executionSide === 'long' ? bestBid : bestAsk).toFixed(10)
+        );
         orderPrice = limitPrice;
         makerReferencePrice = executionSide === 'long' ? bestAsk : bestBid;
 
